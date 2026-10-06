@@ -1,0 +1,7 @@
+{
+  "name": "pi-agent-supervisor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Planned Pi extension for supervising configured headless coding agents"
+}
