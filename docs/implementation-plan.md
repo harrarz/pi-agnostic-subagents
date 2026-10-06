@@ -63,6 +63,17 @@ agent_stop(input: { id: string }): Promise<{ id: string; state: RunState }>;
 - Validate nonempty task, known profile/model alias, allowed cwd, finite positive timeout, and queue capacity **before** admitting a job. Generate IDs on the supervisor side. Bound tool responses and list length.
 - Profiles define executable, static argv with strictly validated placeholders, task transport (`stdin` or one argv element), optional environment, default model, model-alias mappings, and supported/default effort per profile or model. Map effort to arguments through trusted profile data (e.g. Pi `--thinking <level>`; Codex's verified `model_reasoning_effort` config override), never engine-name branches. Resolve executable and argv directly with `spawn` (no shell). Do not treat a model-provided `profile` as an executable path. Prefer stdin when the CLI supports it; argument transport may expose task text in the OS process list. Avoid putting credentials in argv or run logs.
 - Unknown or unsupported explicit model **or effort** selection is an error, never a fallback. When `effort` is omitted, use that model's configured default, then the profile default; do not inherit the parent Pi session's effort by accident. Ensure a profile can launch without model-specific code in the supervisor. If a profile is incompatible with a requested optional capability, reject it explicitly.
+
+**Verified CLI argument mappings (installed Pi 1.0.0 and Codex 0.154.0):** the generic launcher resolves `{model}`/`{effort}` from the chosen trusted profile, then substitutes validated values into an argv array. These are sample profile data, not `if (engine)` branches:
+
+```text
+Pi:     pi --mode json --model <resolved-id> --thinking <resolved-level> -- <task>
+Codex:  codex exec --json --model <resolved-id> --config 'model_reasoning_effort="<resolved-level>"' -
+        (Codex task is written to stdin; quotes above are part of one argv value, not a shell command)
+```
+
+Pi `--help` lists `--thinking` levels `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; Pi may clamp a level to a model's capability, so validate against the selected model/profile before launch where possible. Codex `exec --help` documents `--config key=value` overrides and `--model`; the current local Codex config uses `model_reasoning_effort = "max"`. Verify supported effort values per installed Codex model; do not assume the two CLIs support identical levels. Profile templates must allow a trusted config value such as `model_reasoning_effort="{effort}"` as one argv element while still forbidding shell interpolation and arbitrary untrusted config keys.
+
 - Status represents the process, not the work product: zero exit maps to `exited` with `exitCode: 0`, nonzero exit maps to `exited` with that code and an error summary. Launch failure is separate; cancellation and timeout require observing cleanup. No generic `succeeded` state.
 - Scope runs to the owning Pi session in v1. Stop owned live children on session shutdown/reload; after a crash, reconcile status and process identity, never silently restart. If termination cannot be established, record `interrupted`/uncertainty rather than an invented success.
 
