@@ -1,0 +1,28 @@
+{
+  "defaultProfile": "fake-stdin",
+  "profiles": {
+    "fake-stdin": {
+      "executable": "fake-coding-agent",
+      "args": ["--model", "{model}", "--reasoning", "{effort}", "--"],
+      "taskTransport": "stdin",
+      "environment": { "FAKE_AGENT_MODE": "test" },
+      "defaultModel": "fake/model-steady",
+      "defaultEffort": "deep",
+      "models": {
+        "fake/model-steady": {
+          "defaultEffort": "deep",
+          "efforts": { "deep": "max", "quick": "low" }
+        },
+        "fake/model-swift": {
+          "defaultEffort": "quick",
+          "efforts": { "deep": "high", "quick": "minimal" }
+        }
+      }
+    },
+    "fake-argument": {
+      "executable": "fake-coding-agent",
+      "args": ["--", "{task}"],
+      "taskTransport": "argument"
+    }
+  }
+}
