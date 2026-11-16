@@ -1,6 +1,6 @@
 # Project guidance
 
-Read `docs/implementation-plan.md` before implementing anything. This repository currently contains planning/scaffolding only.
+Read `docs/implementation-plan.md` before implementing anything. This is the implemented Pi Agnostic Subagents extension; legacy `agent-supervisor` configuration paths and public command/tool names remain compatibility contracts.
 
 Keep the extension agent-agnostic: new CLIs are added through trusted launch-profile configuration, not engine-specific supervisor branches. Model and effort overrides are optional; defaults come from the chosen profile/model configuration. Do not add orchestration, automatic reviews, messaging, Herdr, or Whiteboard integration.
 
