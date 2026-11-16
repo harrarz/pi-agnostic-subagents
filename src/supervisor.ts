@@ -452,6 +452,7 @@ export class Supervisor {
 	private async launch(job: Job): Promise<void> {
 		if (job.finished) return;
 		let drainTasks: Promise<void>[] = [];
+		let stdinDelivery: Promise<void> | undefined;
 		try {
 			if (job.cancelRequested || this.closed) {
 				await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was cancelled before process creation" });
@@ -517,14 +518,15 @@ export class Supervisor {
 			];
 			// stdin is a separate stream: ChildProcess's error event does not
 			// handle EPIPE when a CLI exits/rejects input before reading the task.
-			child.stdin?.on("error", (error: Error) => {
+			const stdinFailure = (error: Error) => {
 				job.stdinError ??= error;
 				// Don't signal until the process group has been created and its PID
 				// identity recorded below. Launch will handle an earlier EPIPE.
 				if (job.childStartIdentity && child.pid) {
 					job.terminationPromise ??= terminateOwnedProcessTree(child.pid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
 				}
-			});
+			};
+			child.stdin?.on("error", stdinFailure);
 
 			try {
 				await spawnResult;
@@ -585,11 +587,20 @@ export class Supervisor {
 					});
 				} else {
 					// A stdin reader must not consume/exit before its ownership checkpoint.
-					if (job.stdin !== undefined) child.stdin?.end(job.stdin, "utf8");
-					else child.stdin?.end();
+					if (job.stdin !== undefined) {
+						stdinDelivery = new Promise<void>((resolveDelivery) => {
+							child.stdin!.end(job.stdin, "utf8", (error?: Error | null) => {
+								if (error) stdinFailure(error);
+								resolveDelivery();
+							});
+						});
+					} else child.stdin?.end();
 				}
 			}
 			const close = await job.closePromise;
+			// Stream callbacks can lag child close. Do not finalize a clean exit
+			// before the task write has either flushed or reported its failure.
+			await stdinDelivery;
 			if (job.record.control && existsSync(job.record.control.sessionPath)) await chmod(job.record.control.sessionPath, 0o600);
 			if (job.timeout) clearTimeout(job.timeout);
 			job.timeout = undefined;
