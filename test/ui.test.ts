@@ -24,7 +24,8 @@ function run(index: number, state: RunSummary["state"] = "running"): RunSummary 
 	};
 }
 class FakeSupervisor {
-	runs: RunSummary[] = [run(1), run(2, "queued")];
+	recoveryWarnings: string[] = [];
+	runs: RunSummary[] = [run(1), run(2, "starting")];
 	listeners = new Set<() => void>();
 	stops: string[] = [];
 	gets = 0;
@@ -55,7 +56,7 @@ test("browser renders parentage and status without reading diagnostic logs", () 
 		const lines = view.render(100).join("\n");
 		assert.match(lines, /main · parent session parent-s/);
 		assert.match(lines, /agent-1.*running/);
-		assert.match(lines, /agent-2.*queued/);
+		assert.match(lines, /agent-2.*starting/);
 		assert.equal(fake.gets, 0);
 	} finally { view.dispose(); }
 	assert.equal(fake.listeners.size, 0);
@@ -211,7 +212,7 @@ test("late steering fails without silently following up or starting another run"
 	assert.deepEqual(calls, ["steer"]);
 });
 
-test("widget bounds its rows and names overflow instead of filling the terminal", () => {
+test("widget bounds visible active rows, not execution, and renders a one-line process summary", () => {
 	const runs = Array.from({ length: 10 }, (_, i) => run(i));
 	for (const width of [1, 15, 50, 120]) {
 		const lines = widgetLines(runs, width, 24, theme);
@@ -220,6 +221,18 @@ test("widget bounds its rows and names overflow instead of filling the terminal"
 	}
 	assert.match(widgetLines(runs, 120, 24, theme).join("\n"), /more/);
 	assert.deepEqual(widgetLines([], 80, 24, theme), []);
+	assert.deepEqual(widgetLines([run(1, "exited"), run(2, "timed_out")], 80, 24, theme), []);
+	const mixed = widgetLines([run(0, "exited"), run(1), run(2, "starting")], 120, 24, theme).join("\n");
+	assert.match(mixed, /2 active · \/agent/);
+	assert.doesNotMatch(mixed, /0 queued|Concurrency limit/);
+	assert.doesNotMatch(mixed, /agent-0/);
+	for (const width of [1, 15, 50, 120]) {
+		const summary = widgetLines([], width, 1, theme, { finished: 4, failed: 2, cancelled: 1 });
+		assert.equal(summary.length, 1);
+		assert.ok(visibleWidth(summary[0]) <= width);
+	}
+	assert.deepEqual(widgetLines([], 120, 24, theme, { finished: 4, failed: 2, cancelled: 1 }), ["Agents · 4 finished · 2 failed · 1 cancelled · /agent"]);
+	assert.deepEqual(widgetLines([], 120, 0, theme, { finished: 1, failed: 0, cancelled: 0 }), []);
 });
 
 test("event coalescing and disposal cancel pending renders and unsubscribe", async () => {
@@ -253,13 +266,96 @@ test("closing browser stops live updates, and theme invalidation rebuilds styled
 	} finally { theme.fg = original; }
 });
 
-test("TUI widget factory is not called in JSON, RPC or print modes", () => {
+test("widget dismisses after three seconds, reopens for new runs and leaves manual inspection open", (t) => {
 	for (const mode of ["json", "rpc", "print"] as const) {
 		let called = false;
 		const dispose = attachRunWidget({ mode, ui: { setWidget() { called = true; } } } as unknown as PiContext, new FakeSupervisor().asSupervisor());
 		dispose();
 		assert.equal(called, false);
 	}
+	t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	const fake = new FakeSupervisor();
+	fake.runs = [{ ...run(0, "exited"), exitCode: 0 }];
+	let component: { render(width: number): string[]; dispose(): void } | undefined;
+	let renders = 0;
+	let removed = false;
+	const ctx = { mode: "tui", ui: {
+		setWidget(_key: string, factory: Function | undefined) {
+			if (factory) component = factory({ terminal: { rows: 24 }, requestRender() { renders++; } }, theme);
+			else { removed = true; component?.dispose(); }
+		},
+	} } as unknown as PiContext;
+	const dispose = attachRunWidget(ctx, fake.asSupervisor());
+	const lines = () => component!.render(120);
+	assert.deepEqual(lines(), [], "restored terminal history must never resurrect the widget");
+	fake.emit();
+	t.mock.timers.tick(4000);
+	assert.deepEqual(lines(), []);
+	fake.runs.unshift(run(1));
+	fake.emit();
+	assert.match(lines().join("\n"), /agent-1.*running/, "new work is shown without a render debounce");
+	const inspection = browser(fake);
+	inspection.view.handleInput("enter");
+	fake.runs[0].state = "exited";
+	fake.runs[0].exitCode = 0;
+	fake.emit();
+	assert.deepEqual(lines(), ["Agents · 1 finished · /agent"]);
+	t.mock.timers.tick(2999);
+	assert.equal(lines().length, 1);
+	t.mock.timers.tick(1);
+	assert.deepEqual(lines(), [], "expiry must repaint even with no new supervisor event");
+	assert.equal(inspection.closed, false);
+	assert.match(inspection.view.render(120).join("\n"), /Final answer/);
+	assert.match(inspection.view.render(120).join("\n"), /agent-1/);
+	inspection.view.handleInput("escape");
+	inspection.view.handleInput("escape");
+	assert.equal(inspection.closed, true);
+	inspection.view.dispose();
+	const hiddenRenders = renders;
+	t.mock.timers.tick(5000);
+	assert.equal(renders, hiddenRenders, "idle widgets must not retain a refresh clock");
+	fake.emit();
+	assert.deepEqual(lines(), [], "metadata changes must not restart the summary timer");
+
+	fake.runs.unshift(run(2, "starting"));
+	fake.emit();
+	fake.runs[0].state = "cancelled";
+	fake.emit();
+	assert.deepEqual(lines(), ["Agents · 1 finished · 1 cancelled · /agent"], "short starting-run cancellations must be observed");
+	t.mock.timers.tick(2000);
+	fake.runs.unshift(run(3));
+	fake.emit();
+	t.mock.timers.tick(1001);
+	assert.match(lines().join("\n"), /agent-3.*running/, "a stale dismissal must not hide a new run");
+	fake.runs.unshift(run(4, "starting"));
+	fake.emit();
+	fake.runs[1].state = "timed_out";
+	fake.emit();
+	assert.match(lines().join("\n"), /agent-4.*starting/);
+	assert.doesNotMatch(lines().join("\n"), /agent-3/, "finished rows disappear while other work continues");
+	fake.runs[0].state = "launch_failed";
+	fake.emit();
+	assert.deepEqual(lines(), ["Agents · 2 finished · 2 failed · /agent"]);
+	t.mock.timers.tick(3000);
+	assert.deepEqual(lines(), [], "failures must not pin the status pane");
+	fake.runs.unshift(run(5));
+	fake.emit();
+	fake.runs[0].state = "exited";
+	fake.runs[0].exitCode = 9;
+	fake.emit();
+	assert.deepEqual(lines(), ["Agents · 1 finished · 1 failed · /agent"], "nonzero exits are process failures");
+	component!.dispose();
+	const disposedRenders = renders;
+	t.mock.timers.tick(5000);
+	fake.emit();
+	assert.equal(renders, disposedRenders);
+	assert.equal(fake.listeners.size, 0);
+	assert.deepEqual(lines(), []);
+	dispose(); dispose();
+	assert.equal(removed, true);
+	const reattach = attachRunWidget(ctx, fake.asSupervisor());
+	assert.deepEqual(lines(), [], "reattachment must suppress even just-completed history");
+	reattach();
 });
 
 test("tool response bounds apply after JSON escaping, not just to source characters", async () => {

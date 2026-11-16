@@ -64,6 +64,11 @@ class TerminalSession:
             live_config = json.loads((self.config / "profiles.json").read_text())
             profiles["profiles"]["pi"] = live_config["profiles"]["pi"]
         (self.config / "profiles.json").write_text(json.dumps(profiles))
+        # Ask the actual loader for selectable profile identities, including bundled defaults.
+        choices = subprocess.run([NODE, "--import", "tsx", "--input-type=module", "-e",
+            "import {loadSupervisorConfig} from './src/config.ts'; const c=await loadSupervisorConfig(process.argv[1]); console.log(JSON.stringify(Object.entries(c.profiles).filter(([,p])=>p.modelArgs).map(([name])=>name)));",
+            str(self.config / "profiles.json")], cwd=REPO, check=True, capture_output=True, text=True)
+        self.model_profiles = json.loads(choices.stdout)
         self.project = self.root / "project"
         self.project.mkdir()
         (self.project / "tui-seed.txt").write_text("terminal proof\n")
@@ -75,7 +80,7 @@ class TerminalSession:
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
         env = dict(os.environ, PI_CODING_AGENT_DIR=str(self.config.parent), PI_OFFLINE="1", PI_TELEMETRY="0", TERM="xterm-256color")
         self.process = subprocess.Popen([
-            os.environ.get("PI_BIN", "/opt/homebrew/bin/pi"),
+            os.environ.get("PI_BIN", "pi"),
             "--offline", "--no-session", "--no-extensions", "--extension", str(REPO / "src/index.ts"),
             "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tui-mode", mode,
         ], stdin=slave, stdout=slave, stderr=slave, cwd=self.project, env=env, start_new_session=True)
@@ -99,6 +104,10 @@ class TerminalSession:
 
     def command(self, text):
         self.send(text + "\r")
+        self.pump(0.15)
+
+    def select_model_profile(self, name):
+        self.send("\x1b[B" * self.model_profiles.index(name) + "\r")
         self.pump(0.15)
 
     def records(self):
@@ -152,7 +161,13 @@ def smoke(mode, live):
     with tempfile.TemporaryDirectory(prefix="pi-supervisor-tui-") as root:
         terminal = TerminalSession(mode, root, live)
         try:
-            terminal.pump(2)
+            # Wait for session initialization instead of racing a fixed startup sleep.
+            ready_by = time.monotonic() + 20
+            while not list(terminal.config.glob("runtime/runs/*")) and time.monotonic() < ready_by:
+                terminal.pump(0.1)
+                assert terminal.process.poll() is None, "Pi exited during startup"
+            assert list(terminal.config.glob("runtime/runs/*")), "supervisor session did not initialize"
+            terminal.pump(0.5)
             terminal.command("/agent")
             terminal.pump(0.15)
             assert "No agents." in terminal.captured.decode("utf-8", errors="replace"), "loading should not spawn work"
@@ -167,9 +182,12 @@ def smoke(mode, live):
             expected = "LIVE_TUI_OK" if live else "Clean final answer 雪"
             assert completed.get("presentation", {}).get("finalAnswer") == expected
             assert group_gone(completed)
-            terminal.pump(0.3)
+            # The automatic widget expires, but an explicitly opened answer stays.
+            terminal.pump(3.2)
+            before_transcript = len(terminal.captured)
             terminal.send("t")
             terminal.pump(0.3)
+            assert "Transcript" in terminal.captured[before_transcript:].decode("utf-8", errors="replace"), "completion expiry must not close manual inspection"
             fcntl.ioctl(terminal.master, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 60, 0, 0))
             os.kill(terminal.process.pid, signal.SIGWINCH)
             terminal.pump(0.3)
@@ -178,10 +196,23 @@ def smoke(mode, live):
             assert "FORGED STDERR ANSWER" not in before_diagnostics
             terminal.send("d")  # Raw logs must be reachable only on explicit inspection.
             terminal.pump(0.3)
+            # Long live prompts wrap to more metadata rows than fake JSON tasks.
+            # Scroll one row at a time so the log heading cannot be skipped.
+            for _ in range(100):
+                if "Combined log:" in terminal.captured.decode("utf-8", errors="replace"):
+                    break
+                terminal.send("\x1b[B")
+                terminal.pump(0.08)
+            assert "Combined log:" in terminal.captured.decode("utf-8", errors="replace")
             terminal.send("\x1b[F")  # End: expose the bottom of the diagnostic snapshot.
             terminal.pump(0.15)
-            assert "Combined log:" in terminal.captured.decode("utf-8", errors="replace")
             terminal.back_to_editor()
+            # Resize forces a fresh editor repaint, not a search through old scrollback.
+            after_expiry = len(terminal.captured)
+            fcntl.ioctl(terminal.master, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 61, 0, 0))
+            os.kill(terminal.process.pid, signal.SIGWINCH)
+            terminal.pump(0.3)
+            assert "Agents ·" not in terminal.captured[after_expiry:].decode("utf-8", errors="replace"), "idle widget must return its rows to the editor"
 
             # Real keyboard actions over a bidirectional child, with no provider.
             terminal.command('/agent run --label guided --profile interactive -- {"delayMs":60000}')
@@ -233,8 +264,7 @@ def smoke(mode, live):
 
             # Settings UI persists a user choice; explicit run overrides still win.
             terminal.command("/agent settings")
-            terminal.send("\r")  # selectable profile (fake has no model setting)
-            terminal.pump(0.15)
+            terminal.select_model_profile("selectable")
             terminal.send("\x1b[B\x1b[B\r")  # Enter exact model ID
             terminal.pump(0.15)
             terminal.send("test-model-a\r")
@@ -250,8 +280,7 @@ def smoke(mode, live):
             explicit = terminal.wait_run("explicit-model", "exited")
             assert explicit["model"] == "test-model-b"
             terminal.command("/agent config")  # settings alias
-            terminal.send("\r")
-            terminal.pump(0.15)
+            terminal.select_model_profile("selectable")
             terminal.send("\r")  # Follow parent
             terminal.pump(0.2)
             terminal.send("\x1b")
@@ -288,14 +317,21 @@ def smoke(mode, live):
 
             terminal.command('/agent run --label cancel-me --profile fake -- {"mode":"sleep","ms":60000}')
             running = terminal.wait_run("cancel-me", "running")
-            terminal.command('/agent run --label queued-me --profile fake -- {"mode":"sleep","ms":60000}')
-            queued = terminal.wait_run("queued-me", "queued")
+            terminal.command('/agent run --label shared-peer --profile fake -- {"mode":"sleep","ms":60000}')
+            peer = terminal.wait_run("shared-peer", "running")
+            assert next(run for run in terminal.records() if run["id"] == running["id"])["state"] == "running"
+            assert running["cwd"] == peer["cwd"], "shared-folder writers must overlap by default"
+            terminal.command('/agent run --label third-writer --profile fake -- {"mode":"sleep","ms":60000}')
+            third = terminal.wait_run("third-writer", "running")
+            assert all(next(item for item in terminal.records() if item["id"] == run["id"])["state"] == "running" for run in [running, peer, third]), "all three agents must run without a scheduler queue"
             terminal.command("/agent")
             terminal.pump(0.3)
             terminal.back_to_editor()
-            cancelled_queue = terminal.stop_from_browser(queued)
-            assert not cancelled_queue.get("processPid"), "queued cancellation must not spawn a child"
+            stopped_third = terminal.stop_from_browser(third)
+            assert stopped_third.get("processPid"), "the third agent must have launched instead of waiting for capacity"
             terminal.stop_from_browser(running, cancel_first=True)
+            assert next(run for run in terminal.records() if run["id"] == peer["id"])["state"] == "running"
+            terminal.stop_from_browser(peer)
 
             terminal.command('/agent run --label deadline --profile fake --timeout-ms 300 -- {"mode":"sleep","ms":60000}')
             timed_out = terminal.wait_run("deadline", "timed_out")
@@ -321,12 +357,12 @@ def smoke(mode, live):
             terminal.process.wait(timeout=5)
             assert terminal.process.returncode == 0
             text = terminal.captured.decode("utf-8", errors="replace")
-            for required in ["auth-check", "Final answer", expected, "Transcript", "Checkout busy", "timed out", "Stop selected agent"]:
+            for required in ["auth-check", "Final answer", expected, "Transcript", "Agents · 3 active", "timed out", "Stop selected agent"]:
                 assert required in text, f"{mode}: missing {required!r} in terminal capture"
-            for forbidden in ["TypeError", "Extension Error"]:
+            for forbidden in ["TypeError", "Extension Error", "Concurrency limit", "CAPACITY_FULL"]:
                 assert forbidden not in text, f"{mode}: leaked {forbidden!r}"
             assert all(group_gone(run) for run in terminal.records()), "no owned process groups may remain"
-            print(f"{mode}: {'LIVE Pi child' if live else 'fake child'}; borders/inline steer/follow-up/rerun/cancel, status/answer/transcript/resize, model settings/save/override/clear, parallel worktrees/retention/cleanup, queue, cancelled confirmation, queued/running stop, timeout, invalid profile, reload and quit cleanup passed")
+            print(f"{mode}: {'LIVE Pi child' if live else 'fake child'}; borders/inline steer/follow-up/rerun/cancel, status/answer/transcript/resize/idle-dismissal/manual-view retention, model settings/save/override/clear, parallel shared writers/worktrees/retention/cleanup, unrestricted shared launches, cancelled confirmation, starting/running stop, timeout, invalid profile, reload and quit cleanup passed")
         except Exception:
             Path(f"/tmp/pi-supervisor-tui-{mode}.log").write_bytes(terminal.captured)
             raise

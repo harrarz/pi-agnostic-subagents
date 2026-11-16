@@ -8,6 +8,13 @@ import type { Supervisor } from "./supervisor.js";
 import { actionLabel, browserActions, executeBrowserRequest, type BrowserAction, type BrowserRequest } from "./ui-actions.js";
 
 const WIDGET_KEY = "agent-supervisor";
+const WIDGET_COMPLETION_MS = 3000;
+
+interface WidgetCompletion {
+	finished: number;
+	failed: number;
+	cancelled: number;
+}
 
 /** Coalesces streaming events, advances elapsed time, and owns all timers. */
 export function watchRuns(supervisor: Supervisor, refresh: () => void): () => void {
@@ -30,20 +37,24 @@ export function watchRuns(supervisor: Supervisor, refresh: () => void): () => vo
 	};
 }
 
-export function widgetLines(runs: RunSummary[], width: number, height: number, theme: Theme): string[] {
-	if (!runs.length || height < 3) return [];
+export function widgetLines(runs: RunSummary[], width: number, height: number, theme: Theme, completion?: WidgetCompletion): string[] {
+	if (width < 1 || height < 1) return [];
 	const active = runs.filter((run) => !isTerminalState(run.state));
-	const queued = active.filter((run) => run.state === "queued").length;
-	const items = active.length ? active : runs.slice(0, 2);
+	if (!active.length) {
+		if (!completion?.finished) return [];
+		const outcome = `${completion.finished} finished${completion.failed ? ` · ${completion.failed} failed` : ""}${completion.cancelled ? ` · ${completion.cancelled} cancelled` : ""}`;
+		return [truncateToWidth(theme.fg(completion.failed ? "warning" : "dim", `Agents · ${outcome} · /agent`), width)];
+	}
+	if (height < 3) return [];
 	const budget = Math.max(1, Math.min(4, Math.floor(height / 4)));
-	const shown = items.slice(0, budget);
-	const lines = [theme.fg("accent", `Agents · ${active.length - queued} active · ${queued} queued · /agent`), theme.fg("dim", "main")];
+	const shown = active.slice(0, budget);
+	const lines = [theme.fg("accent", `Agents · ${active.length} active · /agent`), theme.fg("dim", "main")];
 	for (const [index, run] of shown.entries()) {
-		const branch = index === shown.length - 1 && items.length <= budget ? "└─" : "├─";
+		const branch = index === shown.length - 1 && active.length <= budget ? "└─" : "├─";
 		lines.push(`${branch} ${runLine(run, Date.now(), theme)}${runActivity(run) ? ` · ${oneLine(runActivity(run), 100)}` : ""}`);
 	}
-	if (items.length > shown.length) lines.push(theme.fg("dim", `└─ +${items.length - shown.length} more`));
-	return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
+	if (active.length > shown.length) lines.push(theme.fg("dim", `└─ +${active.length - shown.length} more`));
+	return lines.map((line) => truncateToWidth(line, width));
 }
 
 export function attachRunWidget(ctx: PiContext, supervisor: Supervisor): () => void {
@@ -51,10 +62,62 @@ export function attachRunWidget(ctx: PiContext, supervisor: Supervisor): () => v
 	let disposeComponent: (() => void) | undefined;
 	ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
 		let runs = supervisor.snapshot();
-		const dispose = watchRuns(supervisor, () => { runs = supervisor.snapshot(); tui.requestRender(); });
+		const observed = new Set(runs.filter((run) => !isTerminalState(run.state)).map((run) => run.id));
+		let completion: WidgetCompletion = { finished: 0, failed: 0, cancelled: 0 };
+		let dismissal: ReturnType<typeof setTimeout> | undefined;
+		let clock: ReturnType<typeof setInterval> | undefined;
+		let disposed = false;
+		const refresh = () => {
+			if (disposed) return;
+			runs = supervisor.snapshot();
+			const active = runs.filter((run) => !isTerminalState(run.state));
+			if (active.length && dismissal) {
+				clearTimeout(dismissal);
+				dismissal = undefined;
+				completion = { finished: 0, failed: 0, cancelled: 0 };
+			}
+			const byId = new Map(runs.map((run) => [run.id, run]));
+			for (const id of observed) {
+				// A long-running child can fall outside the latest-50 terminal snapshot.
+				const run = byId.get(id) ?? supervisor.inspect(id);
+				if (!isTerminalState(run.state)) continue;
+				observed.delete(id);
+				completion.finished++;
+				if (run.state === "cancelled") completion.cancelled++;
+				else if (run.state !== "exited" || run.exitCode !== 0 || run.error || run.signal) completion.failed++;
+			}
+			for (const run of active) observed.add(run.id);
+			if (active.length) {
+				clock ??= setInterval(() => { if (!disposed) tui.requestRender(); }, 1000);
+				clock.unref();
+			} else {
+				if (clock) clearInterval(clock);
+				clock = undefined;
+				if (completion.finished && !dismissal) {
+					dismissal = setTimeout(() => {
+						dismissal = undefined;
+						completion = { finished: 0, failed: 0, cancelled: 0 };
+						if (!disposed) tui.requestRender();
+					}, WIDGET_COMPLETION_MS);
+					dismissal.unref();
+				}
+			}
+			tui.requestRender();
+		};
+		// Observe transitions synchronously so even very short runs are counted.
+		// Pi coalesces the render requests independently of these state updates.
+		const unsubscribe = supervisor.subscribe(refresh);
+		const dispose = () => {
+			if (disposed) return;
+			disposed = true;
+			unsubscribe();
+			if (clock) clearInterval(clock);
+			if (dismissal) clearTimeout(dismissal);
+		};
 		disposeComponent = dispose;
+		refresh();
 		return {
-			render: (width: number) => widgetLines(runs, width, tui.terminal.rows, theme),
+			render: (width: number) => disposed ? [] : widgetLines(runs, width, tui.terminal.rows, theme, completion),
 			invalidate() {},
 			dispose,
 		};
@@ -181,6 +244,7 @@ export class AgentBrowser implements Component {
 		run = detail;
 		const presentation = detail.presentation;
 		const lines = [runLine(run), `Parent: main · session ${run.sessionId.slice(0, 8)}`, `Profile: ${run.profile} · ${run.model ?? "CLI configuration"}${run.effortAlias ? ` · ${run.effortAlias}` : ""}`, `Directory: ${run.cwd}`, `Task: ${run.task}`];
+		if (!run.worktree) lines.push("Isolation: shared · concurrent writes; overlapping edits can overwrite each other.");
 		if (run.worktree) lines.push(`Worktree: ${run.worktree.path} · ${run.worktree.state}`, `Branch: ${run.worktree.branch}`, `Source: ${run.worktree.sourceCwd}`, `Base: ${run.worktree.baseCommit}`, run.worktree.note, `Cleanup (clean only): /agent worktree remove ${run.id}`);
 		if (run.control) lines.push(`Conversation: ${run.control.conversationId} · turn ${run.control.turn}${run.control.continuedFrom ? ` · follows ${run.control.continuedFrom}` : ""}`);
 		if (this.mode === "workspace") return [...lines, "", "Workspace is retained. Cleanup is explicit and refuses dirty/ignored files.", `Use /agent worktree remove ${run.id}; branch is kept.`];
