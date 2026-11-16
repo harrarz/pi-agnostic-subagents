@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.1]
+
+- Publish the updated, more concise README. No runtime changes.
+
 ## [0.1.0]
 
 - Prepare the first public release as `@harrarz/pi-agnostic-subagents`.
