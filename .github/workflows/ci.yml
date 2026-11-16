@@ -19,6 +19,9 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - name: Diagnose Linux process inspection (redacted)
+        if: runner.os == 'Linux'
+        run: node scripts/diagnose-process-access.mjs
       - run: npm run check
       - run: npm run test:tui
         if: matrix.node == '24'
