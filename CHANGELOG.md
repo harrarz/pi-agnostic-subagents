@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0]
+
+- Add opt-in worker extension modes (`none`, `inherit`, `custom`), trusted named sets, per-profile preferences, run overrides, and a TUI picker/rerun editor. Existing profiles and the default extension-free launch remain unchanged.
+- Persist resolved selections for follow-up/rerun, suppress this supervisor inside workers, and report extension failures or unsupported blocking dialogs without clean answers or automatic approvals.
+- Await stdin task-write completion before finalizing an exit, so a late write failure cannot become a clean process outcome.
+- Remove planning/validation documents and shorten the configuration guide.
+
 ## [0.1.1]
 
 - Publish the updated, more concise README. No runtime changes.

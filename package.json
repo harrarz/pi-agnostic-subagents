@@ -1,6 +1,6 @@
 {
   "name": "@harrarz/pi-agnostic-subagents",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "license": "MIT",
   "author": "harrarz",
   "keywords": ["pi-package", "pi-extension", "subagents", "coding-agents"],
