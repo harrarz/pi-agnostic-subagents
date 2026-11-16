@@ -13,7 +13,7 @@ export class RpcTransport {
 	private accepted = false;
 	private readonly requests = new Map<string, { command: string; resolve(data: Record<string, unknown>): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
 
-	constructor(private readonly input: Writable, private readonly changed: () => void) {}
+	constructor(private readonly input: Writable, private readonly changed: () => void, private readonly onExtensionFailure?: (error: Error) => void) {}
 
 	get canSteer(): boolean { return this.accepted && !this.settled && !this.closed; }
 
@@ -84,11 +84,22 @@ export class RpcTransport {
 		});
 	}
 
+	private failExtension(message: string): void {
+		this.close(); // Withdraw steering and reject pending controls immediately.
+		this.onExtensionFailure?.(new Error(message));
+	}
+
 	private record(line: string): void {
 		let event: Record<string, unknown>;
 		try { event = JSON.parse(line); } catch { return; }
 		if (!event || typeof event !== "object") return;
-		if (event.type === "agent_settled" && this.started) {
+		if (event.type === "extension_error") {
+			this.failExtension("A worker extension failed. Inspect bounded diagnostics; no clean answer or continuation is available.");
+		} else if (event.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(String(event.method))) {
+			this.failExtension("A worker extension requested interactive UI. Headless workers do not answer or auto-approve extension dialogs; use a headless-compatible extension selection.");
+		} else if (event.type === "extension_ui_request" && event.method === "notify" && event.notifyType === "error") {
+			this.failExtension("A worker extension reported an error. Inspect bounded diagnostics; requested extension coverage cannot be assumed.");
+		} else if (event.type === "agent_settled" && this.started) {
 			this.settled = true;
 			this.changed();
 			this.endIfSettled();

@@ -1,6 +1,7 @@
 import type { PiCommandContext, PiExtensionApi, PiContext } from "./pi-api.js";
 import type { Supervisor, StartInput } from "./supervisor.js";
-import type { SupervisorConfig } from "./profiles.js";
+import type { ExtensionSelection, SupervisorConfig } from "./profiles.js";
+import { extensionLabel, type ExtensionPicker } from "./worker-extensions.js";
 import type { RunView } from "./run-store.js";
 import { openAgentBrowser } from "./ui.js";
 import { safeText } from "./display.js";
@@ -10,6 +11,8 @@ export interface AgentCommandDependencies {
 	getConfig(ctx: PiContext): Promise<SupervisorConfig>;
 	resolveStart?(ctx: PiContext, input: StartInput): Promise<StartInput>;
 	openSettings?(ctx: PiContext): Promise<void>;
+	openExtensions?(ctx: PiContext): Promise<void>;
+	chooseExtensions?(ctx: PiContext, profile: string, current?: ExtensionSelection): ReturnType<ExtensionPicker>;
 }
 
 export interface ParsedRunCommand {
@@ -17,8 +20,8 @@ export interface ParsedRunCommand {
 	options: Omit<StartInput, "task">;
 }
 
-const SUBCOMMANDS = ["run", "list", "show", "stop", "profiles", "settings", "config", "worktree"] as const;
-const COMMAND_USAGE = "Usage: /agent [run [--label name] [--profile name] [--model model-id] [--effort alias] [--cwd path] [--isolation shared|worktree] [--timeout-ms n] -- <task> | list | show <id> | stop <id> | profiles | settings | worktree remove <id>]";
+const SUBCOMMANDS = ["run", "list", "show", "stop", "profiles", "settings", "config", "extensions", "worktree"] as const;
+const COMMAND_USAGE = "Usage: /agent [run [--label name] [--profile name] [--model model-id] [--effort alias] [--extensions none|inherit|custom] [--extension-set name] [--cwd path] [--isolation shared|worktree] [--timeout-ms n] -- <task> | list | show <id> | stop <id> | profiles | settings | extensions | worktree remove <id>]";
 
 function skipWhitespace(input: string, index: number): number {
 	while (index < input.length && /\s/.test(input[index])) index++;
@@ -57,6 +60,8 @@ export function parseRunCommandArgs(rawArgs: string): ParsedRunCommand {
 		["--profile", "profile"],
 		["--model", "model"],
 		["--effort", "effort"],
+		["--extensions", "extensions"],
+		["--extension-set", "extensionSet"],
 		["--cwd", "cwd"],
 		["--isolation", "isolation"],
 		["--timeout-ms", "timeoutMs"],
@@ -94,6 +99,9 @@ export function parseRunCommandArgs(rawArgs: string): ParsedRunCommand {
 			const timeoutMs = Number(value);
 			if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("--timeout-ms must be a positive integer");
 			options.timeoutMs = timeoutMs;
+		} else if (option === "extensions") {
+			if (value !== "none" && value !== "inherit" && value !== "custom") throw new Error("--extensions must be none, inherit, or custom");
+			options.extensions = value;
 		} else if (option === "isolation") {
 			if (value !== "shared" && value !== "worktree") throw new Error("--isolation must be shared or worktree");
 			options.isolation = value;
@@ -144,6 +152,7 @@ function detailText(run: RunView): string {
 		`Isolation: ${run.isolation === "worktree" ? "separate worktree" : "shared · concurrent writes; no conflict prevention"}`,
 		`Task: ${oneLine(run.task, 700)}`,
 	];
+	if (run.extensions) lines.push(`Extensions: ${extensionLabel(run.extensions)} · ${run.extensions.paths.length} selected`);
 	if (run.worktree) lines.push(`Worktree: ${run.worktree.path} (${run.worktree.state})`, `Branch: ${run.worktree.branch}`, `Source: ${run.worktree.sourceCwd} · Base: ${run.worktree.baseCommit}`, run.worktree.note);
 	if (run.exitCode !== undefined) lines.push(`Exit code: ${run.exitCode}`);
 	if (run.signal) lines.push(`Signal: ${run.signal}`);
@@ -162,14 +171,14 @@ async function showRunList(ctx: PiContext, supervisor: Supervisor): Promise<void
 	notify(ctx, listText(runs));
 }
 
-async function showRunDetails(ctx: PiCommandContext, supervisor: Supervisor, id: string): Promise<void> {
-	if (ctx.mode === "tui") { supervisor.inspect(id); await openAgentBrowser(ctx, supervisor, id); return; }
+async function showRunDetails(ctx: PiCommandContext, supervisor: Supervisor, id: string, picker?: ExtensionPicker): Promise<void> {
+	if (ctx.mode === "tui") { supervisor.inspect(id); await openAgentBrowser(ctx, supervisor, id, picker); return; }
 	const run = await supervisor.get(id);
 	notify(ctx, detailText(run));
 }
 
-async function openPicker(ctx: PiCommandContext, supervisor: Supervisor): Promise<void> {
-	await openAgentBrowser(ctx, supervisor);
+async function openPicker(ctx: PiCommandContext, supervisor: Supervisor, picker?: ExtensionPicker): Promise<void> {
+	await openAgentBrowser(ctx, supervisor, undefined, picker);
 }
 
 export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCommandDependencies): void {
@@ -180,10 +189,11 @@ export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCom
 			return choices.length ? choices.map((value) => ({ value, label: value })) : null;
 		},
 		handler: async (rawArgs, ctx) => {
+			const picker: ExtensionPicker | undefined = dependencies.chooseExtensions ? (profile, current) => dependencies.chooseExtensions!(ctx, profile, current) : undefined;
 			const trimmed = rawArgs.trim();
 			if (!trimmed) {
 				try {
-					await openPicker(ctx, await dependencies.getSupervisor(ctx));
+					await openPicker(ctx, await dependencies.getSupervisor(ctx), picker);
 				} catch (error) {
 					if (!ctx.hasUI) throw error;
 					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -209,7 +219,7 @@ export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCom
 						return;
 					case "show": {
 						if (!args) throw new Error("Usage: /agent show <run-id>");
-						await showRunDetails(ctx, supervisor, readToken(args, 0).value);
+						await showRunDetails(ctx, supervisor, readToken(args, 0).value, picker);
 						return;
 					}
 					case "stop": {
@@ -234,6 +244,9 @@ export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCom
 						notify(ctx, removed.worktree!.note);
 						return;
 					}
+					case "extensions":
+						await dependencies.openExtensions?.(ctx);
+						return;
 					case "settings":
 					case "config":
 						if (dependencies.openSettings) await dependencies.openSettings(ctx);
@@ -246,7 +259,7 @@ export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCom
 								const defaultEffort = model.defaultEffort ?? profile.defaultEffort;
 								return `${modelId} [efforts: ${effortAliases}${defaultEffort ? `; default ${defaultEffort}` : ""}]`;
 							}).join("; ") || "model override unsupported";
-							return `${name}${name === config.defaultProfile ? " (default profile)" : ""}: ${profile.executable}; ${profile.modelArgs ? "model: user selection / parent session; " : ""}${modelInfo}`;
+							return `${name}${name === config.defaultProfile ? " (default profile)" : ""}: ${profile.executable}; ${profile.modelArgs ? "model: user selection / parent session; " : ""}${modelInfo}${profile.extensionArgs ? `; extensions: ${extensionLabel(profile.extensions ?? { mode: "none" })} (overridable)` : ""}`;
 						});
 						notify(ctx, lines.join("\n"));
 						return;

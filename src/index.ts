@@ -7,6 +7,7 @@ import { ModelSettings, openModelSettings } from "./model-settings.js";
 import { attachRunWidget } from "./ui.js";
 import { oneLine, safeText } from "./display.js";
 import type { SupervisorConfig } from "./profiles.js";
+import { WorkerExtensions, WORKER_ENV } from "./worker-extensions.js";
 
 interface ActiveSession {
 	sessionId: string;
@@ -32,6 +33,8 @@ function terminalMessage(notice: RunTerminalNotice): string {
 }
 
 export default function agentSupervisorExtension(pi: PiExtensionApi): void {
+	// Inherited/custom workers must never acquire this supervisor's delegation tools.
+	if (process.env[WORKER_ENV] === "1") return;
 	let active: ActiveSession | undefined;
 
 	const getConfig = async (ctx: PiContext): Promise<SupervisorConfig> => {
@@ -63,12 +66,15 @@ export default function agentSupervisorExtension(pi: PiExtensionApi): void {
 		return supervisor;
 	};
 
+	const extensionSettings = () => new WorkerExtensions(getSupervisorPaths().configDirectory);
 	const modelSettings = () => new ModelSettings(getSupervisorPaths().configDirectory);
 	const resolveStart = async (ctx: PiContext, input: StartInput): Promise<StartInput> => modelSettings().resolve(ctx, await getConfig(ctx), input);
 	registerAgentTools(pi, getSupervisor, resolveStart);
 	registerAgentCommands(pi, {
 		getSupervisor, getConfig, resolveStart,
-		openSettings: async (ctx) => openModelSettings(ctx, await getConfig(ctx), modelSettings()),
+		openSettings: async (ctx) => openModelSettings(ctx, await getConfig(ctx), modelSettings(), async () => extensionSettings().openSettings(ctx, await getConfig(ctx))),
+		openExtensions: async (ctx) => extensionSettings().openSettings(ctx, await getConfig(ctx)),
+		chooseExtensions: async (ctx, profile, current) => extensionSettings().choose(ctx, await getConfig(ctx), profile, current),
 	});
 
 	pi.on("session_start", async (_event, ctx) => {

@@ -4,6 +4,7 @@ import type { PiCommandContext, PiContext } from "./pi-api.js";
 import { oneLine, runActivity, runLine, runTitle, safeText, stateIndicator } from "./display.js";
 import { isTerminalState, type RunSummary } from "./run-store.js";
 import type { Supervisor } from "./supervisor.js";
+import { extensionLabel, type ExtensionPicker } from "./worker-extensions.js";
 
 import { actionLabel, browserActions, executeBrowserRequest, type BrowserAction, type BrowserRequest } from "./ui-actions.js";
 
@@ -244,6 +245,7 @@ export class AgentBrowser implements Component {
 		run = detail;
 		const presentation = detail.presentation;
 		const lines = [runLine(run), `Parent: main · session ${run.sessionId.slice(0, 8)}`, `Profile: ${run.profile} · ${run.model ?? "CLI configuration"}${run.effortAlias ? ` · ${run.effortAlias}` : ""}`, `Directory: ${run.cwd}`, `Task: ${run.task}`];
+		if (run.extensions) lines.push(`Extensions: ${extensionLabel(run.extensions)} · ${run.extensions.paths.length} selected`, ...run.extensions.paths.map((path) => `  ${path}`));
 		if (!run.worktree) lines.push("Isolation: shared · concurrent writes; overlapping edits can overwrite each other.");
 		if (run.worktree) lines.push(`Worktree: ${run.worktree.path} · ${run.worktree.state}`, `Branch: ${run.worktree.branch}`, `Source: ${run.worktree.sourceCwd}`, `Base: ${run.worktree.baseCommit}`, run.worktree.note, `Cleanup (clean only): /agent worktree remove ${run.id}`);
 		if (run.control) lines.push(`Conversation: ${run.control.conversationId} · turn ${run.control.turn}${run.control.continuedFrom ? ` · follows ${run.control.continuedFrom}` : ""}`);
@@ -330,7 +332,7 @@ export class AgentBrowser implements Component {
 	}
 }
 
-export async function openAgentBrowser(ctx: PiCommandContext, supervisor: Supervisor, id?: string): Promise<void> {
+export async function openAgentBrowser(ctx: PiCommandContext, supervisor: Supervisor, id?: string, picker?: ExtensionPicker): Promise<void> {
 	if (ctx.mode !== "tui") {
 		if (ctx.hasUI) ctx.ui.notify("Agent browser requires TUI mode. Use /agent list or /agent show <id>.", "warning");
 		return;
@@ -344,7 +346,7 @@ export async function openAgentBrowser(ctx: PiCommandContext, supervisor: Superv
 		id = request.id;
 		initialMode = "list";
 		try {
-			const startedId = await executeBrowserRequest(ctx, supervisor, request);
+			const startedId = await executeBrowserRequest(ctx, supervisor, request, picker);
 			if (startedId) { id = startedId; initialMode = "answer"; }
 		} catch (error) { ctx.ui.notify(safeText(error instanceof Error ? error.message : String(error)), "error"); }
 	}

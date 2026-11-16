@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import type { SupervisorPaths } from "./config.js";
 import type { OutputProtocol, RunPresentation } from "./presentation.js";
 import type { Isolation, WorktreeInfo } from "./worktrees.js";
+import type { ResolvedExtensions } from "./profiles.js";
 
 export type RunState =
 	| "queued" // Legacy records only; new runs launch as starting without a scheduler queue.
@@ -17,6 +18,7 @@ export type RunState =
 	| "interrupted";
 
 export interface StoredRun {
+	extensions?: ResolvedExtensions;
 	control?: { protocol: "pi-rpc"; sessionPath: string; conversationId: string; turn: number; continuedFrom?: string };
 	worktreeOwnerId?: string;
 	isolation?: Isolation;
@@ -94,6 +96,12 @@ function isStoredRun(value: unknown): value is StoredRun {
 		&& (run.processPid === undefined || (Number.isSafeInteger(run.processPid) && run.processPid > 0))
 		&& (run.processStartIdentity === undefined || (typeof run.processStartIdentity === "string" && run.processStartIdentity.length > 0))
 		&& (run.isolation === undefined || run.isolation === "shared" || run.isolation === "worktree")
+		&& (run.extensions === undefined || (run.extensions !== null && typeof run.extensions === "object"
+			&& ["none", "inherit", "custom"].includes(run.extensions.mode)
+			&& (run.extensions.mode === "custom" ? typeof run.extensions.set === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(run.extensions.set) : run.extensions.set === undefined)
+			&& Array.isArray(run.extensions.paths) && run.extensions.paths.every((path) => typeof path === "string" && (path.startsWith("/") || /^builtin:[a-zA-Z0-9.-]+$/.test(path)) && !/[\x00-\x1f\x7f-\x9f]/.test(path))
+			&& (run.extensions.mode !== "none" || run.extensions.paths.length === 0)
+			&& (run.extensions.mode !== "custom" || run.extensions.paths.length > 0)))
 		&& (run.worktree === undefined || isWorktreeInfo(run.worktree))
 		&& (run.worktreeOwnerId === undefined || /^[0-9a-f-]{36}$/.test(run.worktreeOwnerId))
 		&& (run.control === undefined || (run.control?.protocol === "pi-rpc"

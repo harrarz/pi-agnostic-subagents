@@ -2,6 +2,7 @@ import type { PiCommandContext } from "./pi-api.js";
 import { oneLine, safeText } from "./display.js";
 import { isTerminalState, type RunSummary } from "./run-store.js";
 import type { StartInput, Supervisor } from "./supervisor.js";
+import { extensionLabel, type ExtensionPicker } from "./worker-extensions.js";
 
 export type BrowserAction = "inspect" | "steer" | "stop" | "followUp" | "rerun" | "editRerun" | "workspace";
 export interface BrowserRequest { id: string; action: BrowserAction; }
@@ -21,14 +22,19 @@ export function actionLabel(action: BrowserAction, run: RunSummary): string {
 	return action === "stop" && (run.state === "starting" || run.state === "queued") ? "Cancel" : actionLabels[action];
 }
 
-async function editRerun(ctx: PiCommandContext, run: RunSummary): Promise<Partial<StartInput> | undefined> {
-	const draft: Partial<StartInput> = { task: run.task, model: run.model, effort: run.effortAlias, timeoutMs: run.timeoutMs, isolation: run.isolation ?? "shared" };
+async function editRerun(ctx: PiCommandContext, run: RunSummary, picker?: ExtensionPicker): Promise<Partial<StartInput> | undefined> {
+	const draft: Partial<StartInput> = { task: run.task, model: run.model, effort: run.effortAlias, timeoutMs: run.timeoutMs, isolation: run.isolation ?? "shared", extensions: run.extensions?.mode, extensionSet: run.extensions?.set };
 	for (;;) {
-		const choices = ["Run", `Task: ${oneLine(draft.task!, 70)}`, `Model: ${draft.model ?? "CLI configuration"}`, `Effort: ${draft.effort ?? "CLI configuration"}`, `Timeout (ms): ${draft.timeoutMs ?? "none"}`, `Isolation: ${draft.isolation === "shared" ? "shared (concurrent writes)" : "worktree"}`, "Cancel"];
+		const choices = ["Run", `Task: ${oneLine(draft.task!, 70)}`, `Model: ${draft.model ?? "CLI configuration"}`, `Effort: ${draft.effort ?? "CLI configuration"}`, `Timeout (ms): ${draft.timeoutMs ?? "none"}`, `Isolation: ${draft.isolation === "shared" ? "shared (concurrent writes)" : "worktree"}`, ...(picker && run.extensions ? [`Extensions: ${extensionLabel({ mode: draft.extensions!, set: draft.extensionSet })}`] : []), "Cancel"];
 		const choice = await ctx.ui.select("Rerun with changes · fresh conversation/workspace", choices.map(safeText));
 		if (!choice || choice === "Cancel") return;
 		const index = choices.map(safeText).indexOf(choice);
 		if (index === 0) return draft;
+		if (index === 6 && picker && run.extensions) {
+			const selection = await picker(run.profile, { mode: draft.extensions!, set: draft.extensionSet });
+			if (selection) { draft.extensions = selection.mode; draft.extensionSet = selection.set; }
+			continue;
+		}
 		if (index === 5) {
 			const isolation = await ctx.ui.select("Checkout isolation", ["shared (concurrent writes)", "worktree"]);
 			if (isolation === "shared (concurrent writes)") draft.isolation = "shared";
@@ -50,7 +56,7 @@ async function editRerun(ctx: PiCommandContext, run: RunSummary): Promise<Partia
 }
 
 /** Called after the custom browser has completed/disposed, never as a nested overlay. */
-export async function executeBrowserRequest(ctx: PiCommandContext, supervisor: Supervisor, request: BrowserRequest): Promise<string | undefined> {
+export async function executeBrowserRequest(ctx: PiCommandContext, supervisor: Supervisor, request: BrowserRequest, picker?: ExtensionPicker): Promise<string | undefined> {
 	const run = supervisor.inspect(request.id);
 	if (request.action === "steer" || request.action === "followUp") {
 		const message = await ctx.ui.editor(`${request.action === "steer" ? "Steer running agent" : "Follow up in saved conversation"} · ${oneLine(run.label ?? run.task, 60)}`);
@@ -63,7 +69,7 @@ export async function executeBrowserRequest(ctx: PiCommandContext, supervisor: S
 		return (await supervisor.followUp(run.id, message)).id;
 	}
 	if (request.action === "rerun" || request.action === "editRerun") {
-		const changes = request.action === "editRerun" ? await editRerun(ctx, run) : {};
+		const changes = request.action === "editRerun" ? await editRerun(ctx, run, picker) : {};
 		if (!changes) return;
 		if (!await ctx.ui.confirm("Start fresh agent run?", safeText(`Same resolved settings unless edited. No conversation or previous worktree changes are copied.${(changes.isolation ?? run.isolation) === "worktree" ? " New worktree starts from current committed HEAD; previous worktree is retained." : " Uses the current shared folder with concurrent writes; overlapping edits can overwrite each other."}`))) return;
 		return (await supervisor.rerun(run.id, changes)).id;

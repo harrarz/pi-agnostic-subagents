@@ -20,7 +20,8 @@ import {
 	spawnConfiguredProcess,
 	terminateOwnedProcessTree,
 } from "./process.js";
-import { resolveLaunchRecipe, type StartRecipeInput, type SupervisorConfig } from "./profiles.js";
+import { resolveLaunchRecipe, type ResolvedExtensions, type StartRecipeInput, type SupervisorConfig } from "./profiles.js";
+import { WorkerExtensions, WORKER_ENV } from "./worker-extensions.js";
 import { isTerminalState, RunStore, type RunState, type RunView, type RunSummary, type StoredRun } from "./run-store.js";
 import type { Readable } from "node:stream";
 
@@ -98,6 +99,7 @@ interface Job {
 	logChain: Promise<void>;
 	logError?: string;
 	stdinError?: Error;
+	extensionError?: Error;
 }
 
 export class SupervisorError extends Error {
@@ -127,6 +129,7 @@ function validatePositiveInteger(value: number | undefined, fallback: number, na
 
 export class Supervisor {
 	readonly limits: SupervisorLimits;
+	private readonly extensionSettings: WorkerExtensions;
 	private readonly store: RunStore;
 	private readonly worktrees: WorktreeManager;
 	private readonly supervisorToken = randomUUID();
@@ -142,6 +145,7 @@ export class Supervisor {
 			outputTailBytes: validatePositiveInteger(options.outputTailBytes, DEFAULT_OUTPUT_TAIL_BYTES, "outputTailBytes"),
 			stopGraceMs: validatePositiveInteger(options.stopGraceMs, 1200, "stopGraceMs"),
 		};
+		this.extensionSettings = new WorkerExtensions(options.paths.configDirectory);
 		this.store = new RunStore(options.paths, options.sessionId);
 		this.worktrees = new WorktreeManager(options.paths);
 	}
@@ -213,8 +217,12 @@ export class Supervisor {
 	async rerun(id: string, changes: Partial<StartInput> = {}): Promise<StartResult> {
 		const run = await this.get(id);
 		if (!isTerminalState(run.state)) throw new SupervisorError("RUN_ACTIVE", "Only terminal runs can be rerun");
-		return this.start({ task: run.task, label: run.label, profile: run.profile, model: run.model, effort: run.effortAlias,
-			cwd: run.worktree?.sourceCwd ?? run.cwd, isolation: run.isolation, timeoutMs: run.timeoutMs, ...changes });
+		const input: StartInput = { task: run.task, label: run.label, profile: run.profile, model: run.model, effort: run.effortAlias,
+			cwd: run.worktree?.sourceCwd ?? run.cwd, isolation: run.isolation, timeoutMs: run.timeoutMs,
+			extensions: run.extensions?.mode, extensionSet: run.extensions?.set, ...changes };
+		if (input.extensions !== "custom") delete input.extensionSet;
+		const sameSelection = input.extensions === run.extensions?.mode && input.extensionSet === run.extensions?.set && input.profile === run.profile;
+		return this.admit(input, undefined, sameSelection ? run.extensions : undefined);
 	}
 
 	async steer(id: string, message: string): Promise<string> {
@@ -254,7 +262,7 @@ export class Supervisor {
 		};
 	}
 
-	private async admit(input: StartInput, continuation?: StoredRun): Promise<StartResult> {
+	private async admit(input: StartInput, continuation?: StoredRun, pinnedExtensions?: ResolvedExtensions): Promise<StartResult> {
 		this.assertInitialized();
 		const recordId = randomUUID();
 		const sessionPath = continuation?.control?.sessionPath ?? join(this.options.paths.runtimeDirectory, "sessions", `${recordId}.jsonl`);
@@ -269,8 +277,12 @@ export class Supervisor {
 		}
 
 		let recipe;
+		let extensions: ResolvedExtensions | undefined;
 		try {
-			recipe = resolveLaunchRecipe(this.config, input, sessionPath);
+			const profile = this.config.profiles[input.profile ?? this.config.defaultProfile];
+			extensions = await this.extensionSettings.resolve(this.config, input, this.options.parentCwd,
+				{ ...process.env, ...profile?.environment }, pinnedExtensions ?? continuation?.extensions);
+			recipe = resolveLaunchRecipe(this.config, input, sessionPath, extensions?.paths);
 		} catch (error) {
 			throw new SupervisorError("INVALID_PROFILE_INPUT", errorMessage(error));
 		}
@@ -307,6 +319,7 @@ export class Supervisor {
 			const presenter = new OutputPresenter(outputProtocol);
 			const record = this.store.create({
 				isolation,
+				...(extensions ? { extensions } : {}),
 				...(recipe.taskTransport === "pi-rpc" ? { control: { protocol: "pi-rpc" as const, sessionPath,
 					conversationId: continuation?.control?.conversationId ?? recordId, turn: (continuation?.control?.turn ?? 0) + 1,
 					...(continuation ? { continuedFrom: continuation.id } : {}) } } : {}),
@@ -488,10 +501,14 @@ export class Supervisor {
 					...process.env,
 					...(this.config.profiles[job.record.profile]?.environment ?? {}),
 					...processTokenEnvironment(job.record.processToken),
+					[WORKER_ENV]: "1",
 				},
 			});
 			job.child = child;
-			if (job.record.control) job.rpc = new RpcTransport(child.stdin!, () => this.changed());
+			if (job.record.control) job.rpc = new RpcTransport(child.stdin!, () => this.changed(), (error) => {
+				job.extensionError ??= error;
+				if (job.childStartIdentity && child.pid) job.terminationPromise ??= terminateOwnedProcessTree(child.pid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
+			});
 			child.once("close", () => job.rpc?.close());
 			job.closePromise = new Promise<ProcessClose>((resolveClose) => {
 				child.once("close", (exitCode, signal) => resolveClose({ exitCode, signal }));
@@ -570,7 +587,7 @@ export class Supervisor {
 			job.record.state = job.stopReason ? "stopping" : "running";
 			await this.store.persist(job.record);
 			this.changed();
-			if (job.stdinError || job.stopReason) {
+			if (job.stdinError || job.extensionError || job.stopReason) {
 				job.terminationPromise ??= terminateOwnedProcessTree(child.pid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
 			} else if (!exitedBeforeIdentity && job.record.timeoutMs !== undefined) {
 				job.timeout = setTimeout(() => {
@@ -579,7 +596,7 @@ export class Supervisor {
 				job.timeout.unref();
 			}
 
-			if (!exitedBeforeIdentity && !job.stopReason && !job.stdinError) {
+			if (!exitedBeforeIdentity && !job.stopReason && !job.stdinError && !job.extensionError) {
 				if (job.rpc) {
 					void job.rpc.prompt(job.record.task).catch((error: Error) => {
 						job.stdinError ??= error;
@@ -615,6 +632,8 @@ export class Supervisor {
 				await this.finish(job, "timed_out", { code: "TIMEOUT", message: "Run timed out and owned process cleanup was observed" }, close);
 			} else if (job.stopReason === "cancelled") {
 				await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was stopped and owned process cleanup was observed" }, close);
+			} else if (job.extensionError) {
+				await this.finish(job, "interrupted", { code: "WORKER_EXTENSION", message: job.extensionError.message }, close);
 			} else if (job.stdinError) {
 				await this.finish(job, "interrupted", { code: "STDIN_IO", message: `Could not deliver the task to child stdin: ${job.stdinError.message}` }, close);
 			} else {

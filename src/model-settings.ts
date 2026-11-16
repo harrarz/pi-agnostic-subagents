@@ -81,7 +81,7 @@ export function availableModels(ctx: PiContext, profile: LaunchProfile): string[
 	return [...new Set(models)].sort();
 }
 
-export async function openModelSettings(ctx: PiContext, config: SupervisorConfig, settings: ModelSettings): Promise<void> {
+export async function openModelSettings(ctx: PiContext, config: SupervisorConfig, settings: ModelSettings, openExtensions?: () => Promise<void>): Promise<void> {
 	if (ctx.mode !== "tui") {
 		if (ctx.hasUI) ctx.ui.notify("Model settings require TUI mode. Use an explicit --model override outside the TUI.", "warning");
 		return;
@@ -89,14 +89,17 @@ export async function openModelSettings(ctx: PiContext, config: SupervisorConfig
 	for (;;) {
 		const preferences = await settings.load();
 		const profiles = Object.entries(config.profiles).filter(([, profile]) => profile.modelArgs);
-		if (!profiles.length) { ctx.ui.notify("No profiles expose model selection.", "info"); return; }
+		const hasExtensions = Boolean(openExtensions && Object.values(config.profiles).some((profile) => profile.extensionArgs));
+		if (!profiles.length && !hasExtensions) { ctx.ui.notify("No profiles expose model or extension selection.", "info"); return; }
 		const labels = profiles.map(([name, profile]) => {
 			const inherited = ctx.model ? modelName(profile, ctx.model.provider, ctx.model.id) : "none selected";
 			const incompatible = ctx.model && profile.parentProviders && !profile.parentProviders.includes(ctx.model.provider);
 			return `${name} · ${preferences.models[name] ?? `Follow parent (${incompatible ? `incompatible provider: ${ctx.model?.provider}` : inherited})`}`;
 		});
+		if (hasExtensions) labels.push("Worker extension settings…");
 		const selected = await ctx.ui.select("Agent settings · model per profile", labels);
 		if (!selected) return;
+		if (selected === "Worker extension settings…") { await openExtensions?.(); continue; }
 		const entry = profiles[labels.indexOf(selected)];
 		if (!entry) return;
 		const [name, profile] = entry;

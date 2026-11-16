@@ -8,7 +8,9 @@ export const BUNDLED_PROFILE_CONFIG: unknown = {
 		pi: {
 			outputProtocol: "pi-jsonl",
 			executable: "pi",
-			args: ["--no-extensions", "--mode", "rpc", "--session", "{session}", "{modelArgs}", "{effortArgs}"],
+			args: ["{extensionArgs}", "--mode", "rpc", "--session", "{session}", "{modelArgs}", "{effortArgs}"],
+			extensionArgs: { none: ["--no-extensions"], load: ["--extension", "{extension}"] },
+			extensions: { mode: "none" },
 			taskTransport: "pi-rpc",
 			modelArgs: ["--model", "{model}"],
 			effortArgs: ["--thinking", "{effort}"],

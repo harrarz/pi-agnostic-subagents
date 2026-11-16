@@ -1,4 +1,10 @@
+import { isAbsolute } from "node:path";
 import type { OutputProtocol } from "./presentation.js";
+
+export type ExtensionMode = "none" | "inherit" | "custom";
+export interface ExtensionSelection { mode: ExtensionMode; set?: string }
+export interface ResolvedExtensions extends ExtensionSelection { paths: string[] }
+export interface ExtensionArguments { none: string[]; load: string[] }
 
 export type TaskTransport = "stdin" | "argument" | "pi-rpc";
 
@@ -20,11 +26,15 @@ export interface LaunchProfile {
 	modelFormat?: "qualified" | "id";
 	parentProviders?: string[];
 	defaultEffort?: string;
+	/** Explicit capability: a whole {extensionArgs} slot, never executable-name detection. */
+	extensionArgs?: ExtensionArguments;
+	extensions?: ExtensionSelection;
 }
 
 export interface SupervisorConfig {
 	defaultProfile: string;
 	profiles: Record<string, LaunchProfile>;
+	extensionSets?: Record<string, string[]>;
 }
 
 export interface StartRecipeInput {
@@ -32,6 +42,8 @@ export interface StartRecipeInput {
 	profile?: string;
 	model?: string;
 	effort?: string;
+	extensions?: ExtensionMode;
+	extensionSet?: string;
 }
 
 export interface LaunchRecipe {
@@ -48,7 +60,7 @@ export interface LaunchRecipe {
 
 const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const PLACEHOLDERS = new Set(["task", "modelArgs", "effortArgs", "session"]);
+const PLACEHOLDERS = new Set(["task", "modelArgs", "effortArgs", "extensionArgs", "session"]);
 const SHELL_EXPANSION = /\$\(|\$\{|`|\$[A-Za-z_]/;
 
 export class ProfileConfigurationError extends Error {
@@ -142,13 +154,58 @@ function parseArgumentGroup(value: unknown, name: "model" | "effort", path: stri
 	return args;
 }
 
+export function parseExtensionSelection(value: unknown, path = "extensions"): ExtensionSelection {
+	const record = requireRecord(value, path);
+	assertOnlyKeys(record, ["mode", "set"], path);
+	if (!["none", "inherit", "custom"].includes(String(record.mode))) fail(path, "mode must be none, inherit, or custom");
+	const set = record.set === undefined ? undefined : requireName(record.set, `${path}.set`);
+	if ((record.mode === "custom") !== (set !== undefined)) fail(path, "custom mode requires a set; other modes forbid it");
+	return { mode: record.mode as ExtensionMode, ...(set ? { set } : {}) };
+}
+
+export function parseExtensionSets(value: unknown, path = "extensionSets"): Record<string, string[]> {
+	const sets: Record<string, string[]> = Object.create(null);
+	for (const [name, entries] of Object.entries(requireRecord(value, path))) {
+		requireName(name, `${path}.${name}`);
+		if (!Array.isArray(entries) || !entries.length) fail(`${path}.${name}`, "expected a nonempty array of local extension files or builtin IDs");
+		sets[name] = [...new Set(entries.map((entry, index) => {
+			const text = requireText(entry, `${path}.${name}[${index}]`);
+			if (/[\x00-\x1f\x7f-\x9f]/.test(text) || (!isAbsolute(text) && !/^builtin:[a-zA-Z0-9.-]+$/.test(text))) fail(`${path}.${name}`, "use absolute local entry files or builtin:<name>; remote sources and relative paths are not allowed");
+			return text;
+		}))];
+	}
+	return sets;
+}
+
+function parseExtensionArguments(value: unknown, path: string): ExtensionArguments | undefined {
+	if (value === undefined) return undefined;
+	const record = requireRecord(value, path);
+	assertOnlyKeys(record, ["none", "load"], path);
+	const group = (key: "none" | "load") => {
+		const raw = record[key];
+		if (!Array.isArray(raw) || !raw.length) fail(`${path}.${key}`, "expected a nonempty argv array");
+		const args = raw.map((arg, index) => {
+			const text = requireText(arg, `${path}.${key}[${index}]`);
+			rejectShellExpansion(text, path);
+			if (/[{}]/.test(text) && !(key === "load" && text === "{extension}")) fail(path, "only a whole {extension} slot is allowed in load");
+			return text;
+		});
+		if (args.filter((arg) => arg === "{extension}").length !== (key === "load" ? 1 : 0)) fail(path, "load requires exactly one whole {extension} slot");
+		return args;
+	};
+	return { none: group("none"), load: group("load") };
+}
+
 function parseProfile(value: unknown, path: string): LaunchProfile {
 	const record = requireRecord(value, path);
-	assertOnlyKeys(record, ["executable", "args", "taskTransport", "environment", "models", "defaultEffort", "outputProtocol", "modelArgs", "effortArgs", "modelFormat", "parentProviders"], path);
+	assertOnlyKeys(record, ["executable", "args", "taskTransport", "environment", "models", "defaultEffort", "outputProtocol", "modelArgs", "effortArgs", "modelFormat", "parentProviders", "extensionArgs", "extensions"], path);
 	if (record.outputProtocol !== undefined && (typeof record.outputProtocol !== "string" || !["raw", "text", "pi-jsonl", "codex-jsonl"].includes(record.outputProtocol))) {
 		fail(`${path}.outputProtocol`, "expected raw, text, pi-jsonl, or codex-jsonl");
 	}
 
+	const extensionArgs = parseExtensionArguments(record.extensionArgs, `${path}.extensionArgs`);
+	const extensions = record.extensions === undefined ? undefined : parseExtensionSelection(record.extensions, `${path}.extensions`);
+	if (extensions && !extensionArgs) fail(path, "extensions requires an extensionArgs capability");
 	const modelArgs = parseArgumentGroup(record.modelArgs, "model", `${path}.modelArgs`);
 	const effortArgs = parseArgumentGroup(record.effortArgs, "effort", `${path}.effortArgs`);
 	if (record.modelFormat !== undefined && record.modelFormat !== "qualified" && record.modelFormat !== "id") fail(`${path}.modelFormat`, "expected qualified or id");
@@ -176,7 +233,7 @@ function parseProfile(value: unknown, path: string): LaunchProfile {
 		if (matches.length === 1 && !PLACEHOLDERS.has(matches[0][1])) {
 			fail(`${path}.args[${index}]`, `unknown placeholder {${matches[0][1]}}`);
 		}
-		if (["modelArgs", "effortArgs", "session"].includes(matches[0]?.[1]) && parsed !== `{${matches[0][1]}}`) fail(`${path}.args[${index}]`, "argument-group slots must occupy an entire argv element");
+		if (["modelArgs", "effortArgs", "extensionArgs", "session"].includes(matches[0]?.[1]) && parsed !== `{${matches[0][1]}}`) fail(`${path}.args[${index}]`, "argument-group slots must occupy an entire argv element");
 		if (matches[0]?.[1] === "task" && parsed !== "{task}") {
 			fail(`${path}.args[${index}]`, 'the "{task}" placeholder must occupy an entire argv element');
 		}
@@ -186,6 +243,11 @@ function parseProfile(value: unknown, path: string): LaunchProfile {
 	const count = (placeholder: string) => args.reduce((total, arg) => total + [...arg.matchAll(new RegExp(`\\{${placeholder}\\}`, "g"))].length, 0);
 	for (const [name, group] of [["model", modelArgs], ["effort", effortArgs]] as const) {
 		if (count(`${name}Args`) !== (group ? 1 : 0)) fail(`${path}.args`, `${name}Args requires exactly one matching group slot`);
+	}
+	if (count("extensionArgs") !== (extensionArgs ? 1 : 0)) fail(`${path}.args`, "extensionArgs requires exactly one matching group slot");
+	if (extensionArgs) {
+		const managedFlags = ["--no-extensions", "-ne", "--extension", "-e", ...extensionArgs.none, ...extensionArgs.load].filter((arg) => arg.startsWith("-") && arg !== "--");
+		if ([...args, ...(modelArgs ?? []), ...(effortArgs ?? [])].some((arg) => managedFlags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)))) fail(`${path}.args`, "extension flags must be supplied only through {extensionArgs}");
 	}
 	const taskCount = count("task");
 	if (transport === "argument" && taskCount !== 1) {
@@ -223,6 +285,8 @@ function parseProfile(value: unknown, path: string): LaunchProfile {
 	}
 
 	return {
+		...(extensionArgs ? { extensionArgs } : {}),
+		...(extensions ? { extensions } : {}),
 		...(record.outputProtocol !== undefined ? { outputProtocol: record.outputProtocol as OutputProtocol } : {}),
 		executable,
 		args,
@@ -240,7 +304,7 @@ function parseProfile(value: unknown, path: string): LaunchProfile {
 /** User overrides may omit top-level defaults; each supplied profile replaces the whole entry. */
 export function parseSupervisorConfig(value: unknown, defaults?: SupervisorConfig): SupervisorConfig {
 	const record = requireRecord(value, "config");
-	assertOnlyKeys(record, ["defaultProfile", "profiles"], "config");
+	assertOnlyKeys(record, ["defaultProfile", "profiles", "extensionSets"], "config");
 	const defaultProfile = requireName(record.defaultProfile === undefined ? defaults?.defaultProfile : record.defaultProfile, "config.defaultProfile");
 	const rawProfiles = requireRecord(record.profiles === undefined && defaults ? {} : record.profiles, "config.profiles");
 	const profiles = Object.assign(Object.create(null) as Record<string, LaunchProfile>, defaults?.profiles);
@@ -250,16 +314,24 @@ export function parseSupervisorConfig(value: unknown, defaults?: SupervisorConfi
 	}
 	if (Object.keys(profiles).length === 0) fail("config.profiles", "must contain at least one profile");
 	if (!profiles[defaultProfile]) fail("config.defaultProfile", `unknown profile ${JSON.stringify(defaultProfile)}`);
-	return { defaultProfile, profiles };
+	const extensionSets = { ...defaults?.extensionSets, ...(record.extensionSets === undefined ? {} : parseExtensionSets(record.extensionSets)) };
+	return { defaultProfile, profiles, ...(Object.keys(extensionSets).length ? { extensionSets } : {}) };
 }
 
-export function resolveLaunchRecipe(config: SupervisorConfig, input: StartRecipeInput, sessionPath = "{session}"): LaunchRecipe {
+export function resolveLaunchRecipe(config: SupervisorConfig, input: StartRecipeInput, sessionPath = "{session}", extensionPaths: readonly string[] = []): LaunchRecipe {
 	if (typeof input.task !== "string" || input.task.trim().length === 0 || input.task.includes("\0")) {
 		throw new ProfileConfigurationError("task: expected nonempty text without NUL characters");
 	}
 	const profileName = input.profile ?? config.defaultProfile;
 	const profile = Object.hasOwn(config.profiles, profileName) ? config.profiles[profileName] : undefined;
 	if (!profile) throw new ProfileConfigurationError(`profile: unknown profile ${JSON.stringify(profileName)}`);
+
+	if (!profile.extensionArgs && (input.extensions !== undefined || input.extensionSet !== undefined)) throw new ProfileConfigurationError(`extensions: profile ${JSON.stringify(profileName)} does not declare extension selection support`);
+	if (input.extensions !== undefined && !["none", "inherit", "custom"].includes(input.extensions)) throw new ProfileConfigurationError("extensions: expected none, inherit, or custom");
+	if (input.extensionSet !== undefined) {
+		requireName(input.extensionSet, "extensionSet");
+		if (input.extensions !== "custom") throw new ProfileConfigurationError("extensionSet requires explicit custom mode");
+	}
 
 	let modelId: string | undefined;
 	let modelProfile: ModelProfile | undefined;
@@ -301,6 +373,7 @@ export function resolveLaunchRecipe(config: SupervisorConfig, input: StartRecipe
 		return replacement;
 	});
 	const args = profile.args.flatMap((arg) => {
+		if (arg === "{extensionArgs}") return [...profile.extensionArgs!.none, ...extensionPaths.flatMap((path) => profile.extensionArgs!.load.map((value) => value === "{extension}" ? path : value))];
 		if (arg === "{modelArgs}") return profile.modelArgs!.map(substitute);
 		if (arg === "{effortArgs}") return effortValue === undefined ? [] : profile.effortArgs!.map(substitute);
 		return [substitute(arg)];

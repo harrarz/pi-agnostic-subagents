@@ -35,9 +35,12 @@ def group_gone(run):
 class TerminalSession:
     def __init__(self, mode, root, live):
         self.mode = mode
-        self.root = Path(root)
+        self.root = Path(root).resolve()
         self.config = self.root / "agent" / "agent-supervisor"
         self.config.mkdir(parents=True)
+        self.extension_file = self.config.parent / "extensions" / "worker-probe.ts"
+        self.extension_file.parent.mkdir()
+        self.extension_file.write_text("export default function() {}\n")
         profiles = {"defaultProfile": "fake", "profiles": {"fake": {
             "executable": NODE,
             "args": [str(REPO / "test/fixtures/fake-agent.mjs"), "--", "{task}"],
@@ -51,7 +54,8 @@ class TerminalSession:
         }
         profiles["profiles"]["interactive"] = {
             "executable": NODE,
-            "args": [str(REPO / "test/fixtures/fake-rpc-agent.mjs"), "--session", "{session}"],
+            "args": [str(REPO / "test/fixtures/fake-rpc-agent.mjs"), "{extensionArgs}", "--session", "{session}"],
+            "extensionArgs": {"none": ["--no-extensions"], "load": ["--extension", "{extension}"]},
             "taskTransport": "pi-rpc", "outputProtocol": "pi-jsonl",
         }
         self.live_effort = None
@@ -66,9 +70,14 @@ class TerminalSession:
         (self.config / "profiles.json").write_text(json.dumps(profiles))
         # Ask the actual loader for selectable profile identities, including bundled defaults.
         choices = subprocess.run([NODE, "--import", "tsx", "--input-type=module", "-e",
-            "import {loadSupervisorConfig} from './src/config.ts'; const c=await loadSupervisorConfig(process.argv[1]); console.log(JSON.stringify(Object.entries(c.profiles).filter(([,p])=>p.modelArgs).map(([name])=>name)));",
+            "import {loadSupervisorConfig} from './src/config.ts'; const c=await loadSupervisorConfig(process.argv[1]); console.log(JSON.stringify({models:Object.entries(c.profiles).filter(([,p])=>p.modelArgs).map(([name])=>name),extensions:Object.entries(c.profiles).filter(([,p])=>p.extensionArgs).map(([name])=>name)}));",
             str(self.config / "profiles.json")], cwd=REPO, check=True, capture_output=True, text=True)
-        self.model_profiles = json.loads(choices.stdout)
+        self.model_profiles = json.loads(choices.stdout)["models"]
+        self.extension_profiles = json.loads(choices.stdout)["extensions"]
+        resources = subprocess.run([NODE, "--import", "tsx", "--input-type=module", "-e",
+            "import {WorkerExtensions} from './src/worker-extensions.ts'; const p=new WorkerExtensions(process.argv[1]); console.log(JSON.stringify((await p.catalog(process.cwd(),{PI_CODING_AGENT_DIR:process.argv[2]})).map(r=>r.path)));",
+            str(self.config), str(self.config.parent)], cwd=REPO, check=True, capture_output=True, text=True)
+        self.extension_paths = json.loads(resources.stdout)
         self.project = self.root / "project"
         self.project.mkdir()
         (self.project / "tui-seed.txt").write_text("terminal proof\n")
@@ -287,6 +296,60 @@ def smoke(mode, live):
             terminal.pump(0.15)
             assert "selectable" not in json.loads((terminal.config / "settings.json").read_text())["models"]
 
+            # New worker extension picker: save a named set, choose it as a profile
+            # default, override one run, and change modes in the browser rerun editor.
+            terminal.command("/agent extensions")
+            terminal.send("\x1b[B" * len(terminal.extension_profiles) + "\r")
+            terminal.pump(0.2)
+            terminal.send("pty-tools\r")
+            terminal.pump(0.2)
+            terminal.send("\x1b[B" * (1 + terminal.extension_paths.index(str(terminal.extension_file))) + "\r")
+            terminal.pump(0.2)
+            terminal.send("\r")  # Save selection.
+            terminal.pump(0.2)
+            terminal.send("\x1b[B" * terminal.extension_profiles.index("interactive") + "\r")
+            terminal.pump(0.2)
+            terminal.send("\r")  # Choose mode.
+            terminal.pump(0.2)
+            terminal.send("\x1b[B\x1b[B\r")  # Custom set.
+            terminal.pump(0.2)
+            terminal.send("\r")  # pty-tools.
+            terminal.pump(0.2)
+            terminal.send("\x1b")
+            terminal.pump(0.2)
+            extension_settings = json.loads((terminal.config / "extensions.json").read_text())
+            assert extension_settings["profiles"]["interactive"] == {"mode": "custom", "set": "pty-tools"}
+            assert extension_settings["sets"]["pty-tools"] == [str(terminal.extension_file)]
+            terminal.command('/agent run --label saved-extensions --profile interactive -- {"delayMs":10}')
+            selected_extensions = terminal.wait_run("saved-extensions", "exited")
+            assert selected_extensions["extensions"]["set"] == "pty-tools"
+            terminal.command('/agent run --label no-extensions --profile interactive --extensions none -- {"delayMs":10}')
+            no_extensions = terminal.wait_run("no-extensions", "exited")
+            assert no_extensions["extensions"] == {"mode": "none", "paths": []}
+            terminal.command(f'/agent show {selected_extensions["id"]}')
+            terminal.pump(0.2)
+            terminal.send("\x1b")  # Answer -> list.
+            terminal.pump(0.2)
+            terminal.send("\x1b[C\x1b[C\x1b[C\r")  # Rerun with changes.
+            terminal.pump(0.2)
+            terminal.send("\x1b[B" * 6 + "\r")  # Extensions field.
+            terminal.pump(0.2)
+            terminal.send("\r")  # None.
+            terminal.pump(0.2)
+            prior_ids = {run["id"] for run in terminal.records()}
+            terminal.send("\r")  # Run.
+            terminal.pump(0.2)
+            terminal.send("\r")  # Confirm.
+            until = time.monotonic() + 12
+            extension_rerun = None
+            while time.monotonic() < until:
+                terminal.pump(0.08)
+                extension_rerun = next((run for run in terminal.records() if run["id"] not in prior_ids and run["state"] == "exited"), None)
+                if extension_rerun:
+                    break
+            assert extension_rerun and extension_rerun["extensions"] == {"mode": "none", "paths": []}
+            terminal.back_to_editor()
+
             # Restore room, then exercise real keyboard actions and durable process state.
             fcntl.ioctl(terminal.master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
             os.kill(terminal.process.pid, signal.SIGWINCH)
@@ -362,7 +425,7 @@ def smoke(mode, live):
             for forbidden in ["TypeError", "Extension Error", "Concurrency limit", "CAPACITY_FULL"]:
                 assert forbidden not in text, f"{mode}: leaked {forbidden!r}"
             assert all(group_gone(run) for run in terminal.records()), "no owned process groups may remain"
-            print(f"{mode}: {'LIVE Pi child' if live else 'fake child'}; borders/inline steer/follow-up/rerun/cancel, status/answer/transcript/resize/idle-dismissal/manual-view retention, model settings/save/override/clear, parallel shared writers/worktrees/retention/cleanup, unrestricted shared launches, cancelled confirmation, starting/running stop, timeout, invalid profile, reload and quit cleanup passed")
+            print(f"{mode}: {'LIVE Pi child' if live else 'fake child'}; borders/inline steer/follow-up/rerun/cancel, status/answer/transcript/resize/idle-dismissal/manual-view retention, model settings/save/override/clear, extension set picker/default/override/browser rerun, parallel shared writers/worktrees/retention/cleanup, unrestricted shared launches, cancelled confirmation, starting/running stop, timeout, invalid profile, reload and quit cleanup passed")
         except Exception:
             Path(f"/tmp/pi-supervisor-tui-{mode}.log").write_bytes(terminal.captured)
             raise

@@ -13,6 +13,8 @@ const StartParams = Type.Object({
 	profile: Type.Optional(Type.String({ description: "Trusted configured profile alias; omitted uses the configured default" })),
 	model: Type.Optional(Type.String({ description: "Exact model override only when the user chooses one; otherwise omit to follow the saved user setting or current parent model" })),
 	effort: Type.Optional(Type.String({ description: "Optional reasoning-effort alias supported by the selected model" })),
+	extensions: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("inherit"), Type.Literal("custom")], { description: "Override extensions on a capable profile: none disables extensions; inherit snapshots enabled user extensions; custom loads only a trusted named set. Omit to use saved/profile defaults." })),
+	extensionSet: Type.Optional(Type.String({ description: "User-approved extension set name; requires extensions: custom. Never supply paths or package sources." })),
 	cwd: Type.Optional(Type.String({ description: "Source directory inside the current checkout; worktree isolation maps committed subdirectories into the new checkout" })),
 	isolation: Type.Optional(Type.Union([Type.Literal("shared"), Type.Literal("worktree")], { description: "shared (default) allows concurrent writes to the current files, with no checkout locking or conflict prevention, including outside Git; worktree creates a separate branch/checkout at committed HEAD for isolated edits. Uncommitted source changes are not copied. Worktree/branch are retained for explicit recovery/cleanup." })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_147_483_647, description: "Optional wall-clock timeout in milliseconds" })),
@@ -35,6 +37,7 @@ function listItem(run: RunSummary) {
 		parent: { sessionId: run.sessionId, label: "main" },
 		state: run.state,
 		profile: run.profile,
+		extensions: run.extensions,
 		isolation: run.isolation ?? "shared",
 		...(run.worktree ? { worktree: run.worktree } : {}),
 		model: run.model,
@@ -79,7 +82,7 @@ export function registerAgentTools(pi: PiExtensionApi, getSupervisor: Supervisor
 			const supervisor = await getSupervisor(ctx);
 			const started = await supervisor.start(resolveStart ? await resolveStart(ctx, params) : params);
 			const run = supervisor.inspect(started.id);
-			return jsonResult({ id: started.id, state: started.state, isolation: run.isolation ?? "shared", ...(run.worktree ? { worktree: run.worktree } : {}) }, `${runLine(run)}${run.worktree ? `\n${run.worktree.note}` : ""}`);
+			return jsonResult({ id: started.id, state: started.state, ...(run.extensions ? { extensions: run.extensions } : {}), isolation: run.isolation ?? "shared", ...(run.worktree ? { worktree: run.worktree } : {}) }, `${runLine(run)}${run.worktree ? `\n${run.worktree.note}` : ""}`);
 		},
 		renderCall: (args, theme) => new Text(theme.fg("toolTitle", `Start agent · ${oneLine(args.label ?? args.task ?? "…", 100)}`), 0, 0),
 		renderResult: renderAgentResult,

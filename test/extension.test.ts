@@ -151,6 +151,36 @@ test("parses run flags without invoking a shell and preserves the task remainder
 	assert.throws(() => parseRunCommandArgs("--isolation worktree --isolation shared task"), /only be used once/);
 });
 
+test("public agent_start accepts extension modes and named sets, persists them, and rejects arbitrary paths", async () => {
+	const { root, project, cleanup } = await setup();
+	const api = fakePi();
+	const ctx = context(project, "extension-mode-tools", "json", false);
+	try {
+		const file = join(root, "selected-extension.ts");
+		await writeFile(file, "export default function() {}\n");
+		const config = JSON.parse(configText());
+		config.profiles.fake.extensionArgs = { none: ["--no-extensions"], load: ["--extension", "{extension}"] };
+		config.profiles.fake.args.splice(1, 0, "{extensionArgs}");
+		config.extensionSets = { selected: [file] };
+		await writeFile(getSupervisorPaths().profilesFile, JSON.stringify(config));
+		extension(api.pi as PiExtensionApi);
+		const start = api.tools.get("agent_start"), get = api.tools.get("agent_get");
+		assert.ok(start.parameters.properties.extensions);
+		assert.ok(start.parameters.properties.extensionSet);
+		const result = await start.execute("custom", { task: "{\"mode\":\"echo\"}", extensions: "custom", extensionSet: "selected" }, undefined, undefined, ctx.ctx);
+		assert.equal(result.details.extensions.mode, "custom");
+		const run = await waitForRun(get, ctx.ctx, result.details.id, "exited");
+		assert.equal(run.extensions.set, "selected");
+		assert.equal(run.extensions.paths.length, 1);
+		assert.equal(run.extensions.paths[0].endsWith("selected-extension.ts"), true);
+		await assert.rejects(start.execute("unapproved", { task: "x", extensions: "custom", extensionSet: file }, undefined, undefined, ctx.ctx), /safe name/);
+		await assert.rejects(start.execute("unknown", { task: "x", extensions: "custom", extensionSet: "missing" }, undefined, undefined, ctx.ctx), /Unknown worker extension set/);
+	} finally {
+		for (const handler of api.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, ctx.ctx);
+		await cleanup();
+	}
+});
+
 test("registers tools/command, starts and inspects a real child in JSON mode, and notifies once", async () => {
 	const { root, project, cleanup } = await setup();
 	try {
