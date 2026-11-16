@@ -218,9 +218,11 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 			const entries = (await readdir("/proc")).filter((name) => /^\d+$/.test(name));
 			for (let offset = 0; offset < entries.length; offset += 32) {
 				await Promise.all(entries.slice(offset, offset + 32).map(async (name) => {
+					let phase = "uid";
 					try {
 						if ((await stat(`/proc/${name}`)).uid !== process.getuid!()) return;
 						if (earliestTicks !== undefined) {
+							phase = "birth";
 							const born = linuxStartTicks(await getProcessStartIdentity(Number(name)));
 							if (born === undefined) {
 								if (!isPidAlive(Number(name))) return;
@@ -231,11 +233,22 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 							// not make every later run's ownership scan unverifiable.
 							if (born < earliestTicks) return;
 						}
+						phase = "environment";
 						const env = await readFile(`/proc/${name}/environ`);
 						if (env.toString("utf8").split("\0").includes(marker)) pids.add(Number(name));
 					} catch (error) {
 						if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) {
-							debugInspection("proc-access-unavailable", { code: (error as NodeJS.ErrnoException).code ?? "identity" });
+							let state: string | undefined;
+							let parentIsSelf: boolean | undefined;
+							if (process.env.PI_AGENT_SUPERVISOR_DEBUG_PROCESS === "1") {
+								try {
+									const line = await readFile(`/proc/${name}/stat`, "utf8");
+									const fields = line.slice(line.lastIndexOf(")") + 1).trim().split(/\s+/);
+									state = /^[A-Z]$/.test(fields[0]) ? fields[0] : "unknown";
+									parentIsSelf = fields[1] === String(process.pid);
+								} catch { /* No raw error text or process contents. */ }
+							}
+							debugInspection("proc-access-unavailable", { code: (error as NodeJS.ErrnoException).code ?? "identity", phase, self: Number(name) === process.pid, parentIsSelf, state });
 							throw new Error("Process inspection unavailable");
 						}
 					}
