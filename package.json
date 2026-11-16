@@ -11,7 +11,7 @@
   "homepage": "https://github.com/harrarz/pi-agnostic-subagents#readme",
   "bugs": "https://github.com/harrarz/pi-agnostic-subagents/issues",
   "publishConfig": { "access": "public" },
-  "files": ["src", "docs/configuration.md", "docs/stress-validation.md", "README.md", "LICENSE", "CHANGELOG.md"],
+  "files": ["src", "docs/configuration.md", "README.md", "LICENSE", "CHANGELOG.md"],
   "type": "module",
   "engines": {
     "node": ">=22.19.0"

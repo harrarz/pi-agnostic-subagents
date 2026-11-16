@@ -7,6 +7,7 @@ Launch and control whichever Pi subagent fits your task—no forced roles or wor
 - **Observability:** `/agent` browser and status widget, clean answers, transcripts, diagnostics, and confirmed stop/rerun.
 - **Live controls:** human- or agent-directed steering and saved-session follow-up for RPC-capable profiles.
 - **Owned lifecycle:** timeouts, descendant cleanup, crash recovery, private records, and bounded diagnostic logs.
+- **Worker extensions:** none, inherited user extensions, or custom sets; choose per profile or run.
 
 ## Install
 
@@ -24,7 +25,7 @@ pi install npm:@harrarz/pi-agnostic-subagents
 /agent
 ```
 
-Use the browser to inspect, steer, stop, follow up, or rerun. `/agent settings` saves model preferences; `/agent profiles` lists trusted launch profiles. Unsupported interactive actions are hidden. The model-facing tools are `agent_start`, `agent_get`, and `agent_stop`.
+Use the browser to inspect, steer, stop, follow up, or rerun. `/agent settings` saves preferences; `/agent extensions` selects worker extensions; `/agent profiles` lists trusted launch profiles. Unsupported interactive actions are hidden. The model-facing tools are `agent_start`, `agent_get`, and `agent_stop`.
 
 ## Know the boundaries
 
