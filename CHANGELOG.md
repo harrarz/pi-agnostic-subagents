@@ -8,3 +8,4 @@
 - Add MIT licensing, concise architecture documentation, public package metadata, package-content checks, and offline CI.
 - Handle argument-transport children that exit before the OS birth-identity lookup, only after observing their actual child-process exit and verifying owned descendant cleanup. Unverified live children and unsent stdin/RPC tasks still fail closed.
 - Retry transient process-inspection gaps within the existing cleanup deadline, without signalling from unavailable snapshots. Persistent inspection failures still report interrupted/unverified cleanup.
+- Bound Linux ownership scans by process birth time so protected processes predating the run do not block cleanup. Unreadable potential descendants still fail closed.
