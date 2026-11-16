@@ -67,6 +67,6 @@ npm run test:tui        # actual terminals with fake children; no inference
 pi -e ./src/index.ts    # one-off local trial
 ```
 
-Provider-backed checks are separately opt-in and may consume quota; see the guides before running them.
+Development tests require Git; Linux zombie regression and terminal checks also require Python 3. Provider-backed checks are separately opt-in and may consume quota; see the guides before running them.
 
 [Configuration and custom CLIs](docs/configuration.md) · [Validation history](docs/stress-validation.md) · [MIT license](LICENSE)
