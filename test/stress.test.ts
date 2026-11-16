@@ -202,7 +202,7 @@ test("STRESS detached SIGTERM-resistant children that fork during cleanup are re
 		assert.ok(results.every((run) => run.state === expected), JSON.stringify(results.map((run) => ({ state: run.state, error: run.error }))));
 		for (const record of await f.records()) {
 			assert.equal(isProcessGroupAlive(record.processPid!), false);
-			assert.deepEqual(await findOwnedProcesses(record.processToken), []);
+			assert.deepEqual(await findOwnedProcesses(record.processToken, record.processStartIdentity), []);
 		}
 		const descendants = (await readdir(f.root)).filter((file) => /^ready-\d\.\d(?:\.fork)?$/.test(file));
 		assert.equal(descendants.filter((file) => file.endsWith(".fork")).length, 4, "each detached child must actually fork during SIGTERM cleanup");
@@ -239,7 +239,7 @@ test("STRESS crash recovery reconciles six valid active runs despite two corrupt
 		for (const run of original.slice(2)) {
 			assert.equal(recovery.inspect(run.id).state, "interrupted");
 			assert.equal(isProcessGroupAlive(run.processPid!), false);
-			assert.deepEqual(await findOwnedProcesses(run.processToken), []);
+			assert.deepEqual(await findOwnedProcesses(run.processToken, run.processStartIdentity), []);
 		}
 		for (const [index, bytes] of corrupt.entries()) {
 			assert.equal(await readFile(join(store.directory, `${original[index].id}.json`), "utf8"), bytes);

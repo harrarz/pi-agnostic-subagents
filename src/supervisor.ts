@@ -406,7 +406,7 @@ export class Supervisor {
 			if (related.some((other) => other.state === "interrupted" || other.worktree?.state === "failed")) throw new SupervisorError("WORKTREE_UNCERTAIN", "Workspace setup or process outcome is uncertain; inspect/recover it with Git manually. No files were deleted.");
 			if (related.some((other) => other.processPid && (isPidAlive(other.processPid) || isProcessGroupAlive(other.processPid)))) throw new SupervisorError("WORKTREE_ACTIVE", "A process/group may still be live; refusing workspace removal");
 			for (const other of related.filter((run) => run.processPid)) {
-				const remaining = await findOwnedProcesses(other.processToken);
+				const remaining = await findOwnedProcesses(other.processToken, other.processStartIdentity);
 				if (!remaining) throw new SupervisorError("WORKTREE_UNCERTAIN", "Could not inspect owned descendants; no files were deleted.");
 				if (remaining.length) throw new SupervisorError("WORKTREE_ACTIVE", "Owned descendants are still live; refusing workspace removal");
 			}

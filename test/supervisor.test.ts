@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
-import { isProcessGroupAlive } from "../src/process.js";
+import { findOwnedProcesses, getProcessStartIdentity, isProcessGroupAlive, processTokenEnvironment, terminateOwnedProcessTree } from "../src/process.js";
 import { parseSupervisorConfig, type SupervisorConfig } from "../src/profiles.js";
 import { RunStore, type StoredRun } from "../src/run-store.js";
 import { Supervisor, SupervisorError } from "../src/supervisor.js";
@@ -346,6 +346,36 @@ test("stops a running process tree and waits until cleanup is observed", async (
 			assert.equal(isProcessGroupAlive(metadata.processPid), false);
 		} finally {
 			if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
+		}
+	} else if (process.platform === "linux") {
+		// A process predating the run cannot be an inheriting descendant, even
+		// if a test deliberately gives it the same marker. Never signal it.
+		const token = randomUUID();
+		const options = { env: { ...process.env, ...processTokenEnvironment(token) }, detached: true, stdio: "ignore" as const };
+		const older = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], options);
+		const olderClosed = once(older, "close");
+		let younger: ReturnType<typeof spawn> | undefined;
+		let youngerClosed: ReturnType<typeof once> | undefined;
+		try {
+			await once(older, "spawn");
+			await new Promise((done) => setTimeout(done, 30));
+			younger = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], options);
+			youngerClosed = once(younger, "close");
+			await once(younger, "spawn");
+			const identity = await getProcessStartIdentity(younger.pid!);
+			assert.ok(identity);
+			const owned = await findOwnedProcesses(token, identity);
+			assert.ok(owned);
+			assert.ok(owned.some((entry) => entry.pid === younger!.pid));
+			assert.equal(owned.some((entry) => entry.pid === older.pid), false);
+			assert.equal(await terminateOwnedProcessTree(younger.pid, identity, token, 100, true), true);
+			assert.equal(older.exitCode, null);
+			assert.equal(older.signalCode, null);
+		} finally {
+			older.kill("SIGKILL");
+			if (younger?.exitCode === null && younger.signalCode === null) younger.kill("SIGKILL");
+			await olderClosed;
+			await youngerClosed;
 		}
 	}
 });

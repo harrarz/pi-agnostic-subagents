@@ -196,10 +196,15 @@ export async function terminateVerifiedProcessGroup(
 
 interface OwnedProcess { pid: number; startIdentity: string }
 
+function linuxStartTicks(identity: string | undefined): bigint | undefined {
+	return identity && /^linux:[0-9]{1,30}$/.test(identity) ? BigInt(identity.slice(6)) : undefined;
+}
+
 /** Same-user token discovery only. Environment snapshots must never reach logs/errors. */
-export async function findOwnedProcesses(token: string): Promise<OwnedProcess[] | undefined> {
+export async function findOwnedProcesses(token: string, earliestIdentity?: string): Promise<OwnedProcess[] | undefined> {
 	if (typeof token !== "string" || !/^[A-Za-z0-9-]{8,128}$/.test(token) || process.platform === "win32" || !process.getuid) return undefined;
 	const marker = `${PROCESS_TOKEN_ENV}=${token}`;
+	const earliestTicks = linuxStartTicks(earliestIdentity);
 	const pids = new Set<number>();
 	try {
 		if (process.platform === "linux") {
@@ -208,6 +213,17 @@ export async function findOwnedProcesses(token: string): Promise<OwnedProcess[] 
 				await Promise.all(entries.slice(offset, offset + 32).map(async (name) => {
 					try {
 						if ((await stat(`/proc/${name}`)).uid !== process.getuid!()) return;
+						if (earliestTicks !== undefined) {
+							const born = linuxStartTicks(await getProcessStartIdentity(Number(name)));
+							if (born === undefined) {
+								if (!isPidAlive(Number(name))) return;
+								throw new Error("Process identity unavailable");
+							}
+							// An older process cannot have inherited this run's new token.
+							// In particular, unrelated protected CI/service processes must
+							// not make every later run's ownership scan unverifiable.
+							if (born < earliestTicks) return;
+						}
 						const env = await readFile(`/proc/${name}/environ`);
 						if (env.toString("utf8").split("\0").includes(marker)) pids.add(Number(name));
 					} catch (error) {
@@ -244,6 +260,10 @@ export async function findOwnedProcesses(token: string): Promise<OwnedProcess[] 
 export async function terminateOwnedProcessTree(
 	pid: number | undefined, startIdentity: string | undefined, token: string, gracefulMs: number, locallyOwned = false,
 ): Promise<boolean> {
+	// The original child's birth bounds all inheriting descendants. For a
+	// locally observed fast exit without that identity, this supervisor's birth
+	// is a conservative earlier floor. Never use a new owner's birth in recovery.
+	const inspectionFloor = startIdentity ?? (locallyOwned && process.platform === "linux" ? await getProcessStartIdentity(process.pid) : undefined);
 	const canSignalGroup = Boolean(pid && (locallyOwned || await isSameOwnedProcess(pid, startIdentity, token)));
 	const groupCleanup = pid && canSignalGroup ? terminateProcessGroup(pid, gracefulMs, true) : Promise.resolve(true);
 	let inspectionFailed = false;
@@ -254,7 +274,7 @@ export async function terminateOwnedProcessTree(
 	// Scan again after signalling: descendants may fork while a parent handles SIGTERM.
 	let emptyScans = 0;
 	while (Date.now() < deadline) {
-		const owned = await findOwnedProcesses(token);
+		const owned = await findOwnedProcesses(token, inspectionFloor);
 		if (!owned) {
 			// A process can disappear between ps/proc snapshots during cleanup.
 			// Do not signal from an unavailable inspection, but retry within the
@@ -282,7 +302,7 @@ export async function terminateOwnedProcessTree(
 		await new Promise((resolveWait) => setTimeout(resolveWait, 30));
 	}
 	const groupGone = await groupCleanup;
-	const remaining = await findOwnedProcesses(token);
+	const remaining = await findOwnedProcesses(token, inspectionFloor);
 	for (const [unverifiedPid, identity] of unverified) {
 		if (isPidAlive(unverifiedPid) && await getProcessStartIdentity(unverifiedPid) === identity) inspectionFailed = true;
 	}

@@ -80,7 +80,7 @@ test("LIVE two Pi worktrees edit the same path independently and a saved follow-
 		const store = new RunStore(paths, sessionId); await store.initialize();
 		for (const run of store.list()) {
 			assert.equal(isProcessGroupAlive(run.processPid!), false);
-			assert.deepEqual(await findOwnedProcesses(run.processToken), []);
+			assert.deepEqual(await findOwnedProcesses(run.processToken, run.processStartIdentity), []);
 		}
 		console.log(`Live parallel Pi verified: ${model}; overlapping worktrees, independently checked 34/51 artifacts, dirty parent untouched, saved follow-up produced 68, no owned descendants remain.`);
 	} finally {
