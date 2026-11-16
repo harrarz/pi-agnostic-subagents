@@ -23,5 +23,7 @@ jobs:
         if: runner.os == 'Linux'
         run: node scripts/diagnose-process-access.mjs
       - run: npm run check
+        env:
+          PI_AGENT_SUPERVISOR_DEBUG_PROCESS: '1'
       - run: npm run test:tui
         if: matrix.node == '24'

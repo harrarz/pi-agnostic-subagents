@@ -7,6 +7,13 @@ import { delimiter, isAbsolute, relative, resolve, sep } from "node:path";
 const execFileAsync = promisify(execFile);
 const PROCESS_TOKEN_ENV = "PI_AGENT_SUPERVISOR_PROCESS_TOKEN";
 
+function debugInspection(reason: string, details: Record<string, string | number | boolean | undefined> = {}): void {
+	if (process.env.PI_AGENT_SUPERVISOR_DEBUG_PROCESS === "1") {
+		// Static categories/counters only; never include commands, tokens or environments.
+		console.error(`[agent-supervisor process] ${reason} ${JSON.stringify(details)}`);
+	}
+}
+
 export class ProcessPreflightError extends Error {
 	constructor(readonly code: string, message: string) {
 		super(message);
@@ -227,7 +234,10 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 						const env = await readFile(`/proc/${name}/environ`);
 						if (env.toString("utf8").split("\0").includes(marker)) pids.add(Number(name));
 					} catch (error) {
-						if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw new Error("Process inspection unavailable");
+						if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+							debugInspection("proc-access-unavailable", { code: (error as NodeJS.ErrnoException).code ?? "identity" });
+							throw new Error("Process inspection unavailable");
+						}
 					}
 				}));
 			}
@@ -249,8 +259,8 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 			if (startIdentity) {
 				const inherited = await processHasToken(pid, token);
 				if (inherited === true) owned.push({ pid, startIdentity });
-				else if (inherited === undefined && isPidAlive(pid)) return undefined;
-			} else if (isPidAlive(pid)) return undefined;
+				else if (inherited === undefined && isPidAlive(pid)) { debugInspection("token-snapshot-unavailable"); return undefined; }
+			} else if (isPidAlive(pid)) { debugInspection("birth-snapshot-unavailable"); return undefined; }
 		}
 		return owned;
 	} catch { return undefined; }
@@ -303,10 +313,14 @@ export async function terminateOwnedProcessTree(
 	}
 	const groupGone = await groupCleanup;
 	const remaining = await findOwnedProcesses(token, inspectionFloor);
+	let unverifiedAlive = 0;
 	for (const [unverifiedPid, identity] of unverified) {
-		if (isPidAlive(unverifiedPid) && await getProcessStartIdentity(unverifiedPid) === identity) inspectionFailed = true;
+		if (isPidAlive(unverifiedPid) && await getProcessStartIdentity(unverifiedPid) === identity) { inspectionFailed = true; unverifiedAlive++; }
 	}
-	return groupGone && (!pid || !isProcessGroupAlive(pid)) && !inspectionFailed && remaining !== undefined && remaining.length === 0;
+	const groupStillAlive = Boolean(pid && isProcessGroupAlive(pid));
+	const verified = groupGone && !groupStillAlive && !inspectionFailed && remaining !== undefined && remaining.length === 0;
+	if (!verified) debugInspection("cleanup-unverified", { groupGone, groupStillAlive, inspectionFailed, unverifiedAlive, scanAvailable: remaining !== undefined, remainingOwners: remaining?.length });
+	return verified;
 }
 
 export interface SpawnOptions {
