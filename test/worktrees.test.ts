@@ -304,7 +304,9 @@ test("crash recovery stops the verified child but preserves branch, workspace an
 });
 
 test("more than ten worktree runs launch concurrently with default options and no queue", async (t) => {
-	const { supervisor } = await fixture(t);
+	// Use production cleanup grace for a simultaneous twelve-process shutdown;
+	// the 100ms fixture override is below hosted-runner scheduling latency.
+	const { supervisor } = await fixture(t, { stopGraceMs: 1200 });
 	const task = JSON.stringify({ mode: "sleep", ms: 60_000 });
 	const runs = await Promise.all(Array.from({ length: 12 }, () => supervisor.start({ task, isolation: "worktree" })));
 	assert.ok(runs.every((run) => run.state === "starting"));
@@ -312,7 +314,10 @@ test("more than ten worktree runs launch concurrently with default options and n
 	assert.equal(new Set(runs.map((run) => supervisor.inspect(run.id).cwd)).size, 12);
 	assert.equal(supervisor.snapshot().filter((run) => run.state === "queued").length, 0);
 	await supervisor.shutdown();
-	for (const run of runs) assert.equal(supervisor.inspect(run.id).state, "cancelled");
+	for (const run of runs) {
+		const stopped = supervisor.inspect(run.id);
+		assert.equal(stopped.state, "cancelled", JSON.stringify(stopped.error));
+	}
 });
 
 test("model tools expose workspace identity and never expose destructive cleanup", async (t) => {
