@@ -93,7 +93,7 @@ export class WorktreeManager {
 		}
 	}
 
-	/** Resume a retained workspace only while its writer lock is held. */
+	/** Verify a retained workspace before a follow-up launches into it. */
 	async resume(info: WorktreeInfo, ownerId: string): Promise<string> {
 		if (info.state !== "retained") throw new WorktreeError("WORKTREE_UNCERTAIN", "Only a retained workspace can be resumed");
 		await this.verifyIdentity(info, ownerId);
@@ -105,7 +105,7 @@ export class WorktreeManager {
 		return cwd;
 	}
 
-	/** Called only by the human command after terminal/process/checkout-lock checks. */
+	/** Called only by the human command after terminal/process/ownership checks. */
 	async remove(info: WorktreeInfo, id: string): Promise<void> {
 		await this.verifyIdentity(info, id);
 		const entries = await this.registrations(info.sourceRoot);

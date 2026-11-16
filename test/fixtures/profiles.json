@@ -3,10 +3,11 @@
   "profiles": {
     "fake-stdin": {
       "executable": "fake-coding-agent",
-      "args": ["--model", "{model}", "--reasoning", "{effort}", "--"],
+      "args": ["{modelArgs}", "{effortArgs}", "--"],
+      "modelArgs": ["--model", "{model}"],
+      "effortArgs": ["--reasoning", "{effort}"],
       "taskTransport": "stdin",
       "environment": { "FAKE_AGENT_MODE": "test" },
-      "defaultModel": "fake/model-steady",
       "defaultEffort": "deep",
       "models": {
         "fake/model-steady": {

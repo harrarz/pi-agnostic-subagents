@@ -1,4 +1,4 @@
-import { access, readFile, realpath, stat } from "node:fs/promises";
+import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
@@ -107,33 +107,32 @@ export async function getProcessStartIdentity(pid: number): Promise<string | und
 	}
 }
 
-async function processHasToken(pid: number, token: string): Promise<boolean> {
-	if (!token || token.includes("\0")) return false;
+async function processHasToken(pid: number, token: string): Promise<boolean | undefined> {
+	if (typeof token !== "string" || !token || token.includes("\0")) return false;
 	if (process.platform === "linux") {
 		try {
 			const environment = await readFile(`/proc/${pid}/environ`);
 			return environment.toString("utf8").split("\0").includes(`${PROCESS_TOKEN_ENV}=${token}`);
-		} catch {
-			return false;
-		}
+		} catch { return undefined; }
 	}
 	try {
-		const { stdout } = await execFileAsync("ps", ["eww", "-p", String(pid)], {
-			encoding: "utf8",
-			timeout: 2000,
-			maxBuffer: 1024 * 1024,
-		});
-		return stdout.includes(`${PROCESS_TOKEN_ENV}=${token}`);
-	} catch {
-		return false;
-	}
+		const options = { encoding: "utf8" as const, timeout: 2000, maxBuffer: 1024 * 1024 };
+		const [withEnvironment, argumentsOnly] = await Promise.all([
+			execFileAsync("ps", ["eww", "-p", String(pid), "-o", "command="], options),
+			execFileAsync("ps", ["ww", "-p", String(pid), "-o", "command="], options),
+		]);
+		const args = argumentsOnly.stdout.trimEnd();
+		if (!args || !withEnvironment.stdout.startsWith(args)) return undefined;
+		// A token printed in argv is data, not proof of inherited ownership.
+		return withEnvironment.stdout.slice(args.length).split(/\s+/).includes(`${PROCESS_TOKEN_ENV}=${token}`);
+	} catch { return undefined; }
 }
 
 export async function isSameOwnedProcess(pid: number | undefined, startIdentity: string | undefined, token: string | undefined): Promise<boolean> {
 	if (!pid || !startIdentity || !token) return false;
 	const currentIdentity = await getProcessStartIdentity(pid);
 	if (!currentIdentity || currentIdentity !== startIdentity) return false;
-	return processHasToken(pid, token);
+	return await processHasToken(pid, token) === true;
 }
 
 export function isPidAlive(pid: number): boolean {
@@ -193,6 +192,94 @@ export async function terminateVerifiedProcessGroup(
 ): Promise<boolean> {
 	if (!await isSameOwnedProcess(pid, startIdentity, token)) return false;
 	return terminateProcessGroup(pid, gracefulMs, true);
+}
+
+interface OwnedProcess { pid: number; startIdentity: string }
+
+/** Same-user token discovery only. Environment snapshots must never reach logs/errors. */
+export async function findOwnedProcesses(token: string): Promise<OwnedProcess[] | undefined> {
+	if (typeof token !== "string" || !/^[A-Za-z0-9-]{8,128}$/.test(token) || process.platform === "win32" || !process.getuid) return undefined;
+	const marker = `${PROCESS_TOKEN_ENV}=${token}`;
+	const pids = new Set<number>();
+	try {
+		if (process.platform === "linux") {
+			const entries = (await readdir("/proc")).filter((name) => /^\d+$/.test(name));
+			for (let offset = 0; offset < entries.length; offset += 32) {
+				await Promise.all(entries.slice(offset, offset + 32).map(async (name) => {
+					try {
+						if ((await stat(`/proc/${name}`)).uid !== process.getuid!()) return;
+						const env = await readFile(`/proc/${name}/environ`);
+						if (env.toString("utf8").split("\0").includes(marker)) pids.add(Number(name));
+					} catch (error) {
+						if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw new Error("Process inspection unavailable");
+					}
+				}));
+			}
+		} else {
+			const { stdout } = await execFileAsync("ps", ["eww", "-U", String(process.getuid()), "-o", "pid=,command="], {
+				encoding: "utf8", timeout: 3000, maxBuffer: 16 * 1024 * 1024,
+			});
+			for (const line of stdout.split("\n")) {
+				if (line.split(/\s+/).includes(marker)) {
+					const pid = Number(line.trimStart().match(/^\d+/)?.[0]);
+					if (Number.isSafeInteger(pid) && pid > 0) pids.add(pid);
+				}
+			}
+		}
+		const owned: OwnedProcess[] = [];
+		for (const pid of pids) {
+			if (pid === process.pid) return undefined; // Never signal this supervisor.
+			const startIdentity = await getProcessStartIdentity(pid);
+			if (startIdentity) {
+				const inherited = await processHasToken(pid, token);
+				if (inherited === true) owned.push({ pid, startIdentity });
+				else if (inherited === undefined && isPidAlive(pid)) return undefined;
+			} else if (isPidAlive(pid)) return undefined;
+		}
+		return owned;
+	} catch { return undefined; }
+}
+
+/** Clean the original group plus token-owned detached processes, rechecking identity per signal. */
+export async function terminateOwnedProcessTree(
+	pid: number | undefined, startIdentity: string | undefined, token: string, gracefulMs: number, locallyOwned = false,
+): Promise<boolean> {
+	const canSignalGroup = Boolean(pid && (locallyOwned || await isSameOwnedProcess(pid, startIdentity, token)));
+	const groupCleanup = pid && canSignalGroup ? terminateProcessGroup(pid, gracefulMs, true) : Promise.resolve(true);
+	let inspectionFailed = false;
+	const unverified = new Map<number, string>();
+	const signalled = new Map<string, "SIGTERM" | "SIGKILL">();
+	const deadline = Date.now() + Math.max(gracefulMs * 3, 1500);
+	const escalateAt = Date.now() + gracefulMs;
+	// Scan again after signalling: descendants may fork while a parent handles SIGTERM.
+	let emptyScans = 0;
+	while (Date.now() < deadline) {
+		const owned = await findOwnedProcesses(token);
+		if (!owned) { inspectionFailed = true; break; }
+		if (owned.length === 0) {
+			if (++emptyScans >= 2) break;
+		} else {
+			emptyScans = 0;
+			for (const child of owned) {
+				if (!await isSameOwnedProcess(child.pid, child.startIdentity, token)) {
+					unverified.set(child.pid, child.startIdentity);
+					continue;
+				}
+				const signal = Date.now() >= escalateAt ? "SIGKILL" : "SIGTERM";
+				const key = `${child.pid}:${child.startIdentity}`;
+				if (signalled.get(key) === signal) continue;
+				try { process.kill(child.pid, signal); signalled.set(key, signal); }
+				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") inspectionFailed = true; }
+			}
+		}
+		await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+	}
+	const groupGone = await groupCleanup;
+	const remaining = await findOwnedProcesses(token);
+	for (const [unverifiedPid, identity] of unverified) {
+		if (isPidAlive(unverifiedPid) && await getProcessStartIdentity(unverifiedPid) === identity) inspectionFailed = true;
+	}
+	return groupGone && (!pid || !isProcessGroupAlive(pid)) && !inspectionFailed && remaining !== undefined && remaining.length === 0;
 }
 
 export interface SpawnOptions {

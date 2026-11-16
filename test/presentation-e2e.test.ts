@@ -3,17 +3,17 @@ import { test, type TestContext } from "node:test";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { Supervisor } from "../src/supervisor.js";
+import { Supervisor, type SupervisorOptions } from "../src/supervisor.js";
 import { parseSupervisorConfig } from "../src/profiles.js";
 import { RunStore, isTerminalState } from "../src/run-store.js";
 import type { OutputProtocol } from "../src/presentation.js";
 
-async function setup(t: TestContext, outputProtocol: OutputProtocol = "pi-jsonl", maxLogBytes = 1024 * 1024) {
+async function setup(t: TestContext, outputProtocol: OutputProtocol = "pi-jsonl", maxLogBytes = 1024 * 1024, options: Partial<SupervisorOptions> = {}) {
 	const root = await mkdtemp(join(tmpdir(), "pi-supervisor-presentation-"));
-	const paths = { configDirectory: join(root, "config"), profilesFile: join(root, "config/profiles.json"), runtimeDirectory: join(root, "runtime"), lockDirectory: join(root, "locks") };
+	const paths = { configDirectory: join(root, "config"), profilesFile: join(root, "config/profiles.json"), runtimeDirectory: join(root, "runtime") };
 	const supervisor = new Supervisor(parseSupervisorConfig({ defaultProfile: "third-party", profiles: { "third-party": {
 		executable: process.execPath, args: [resolve("test/fixtures/fake-agent.mjs"), "--", "{task}"], taskTransport: "argument", outputProtocol,
-	} } }), { paths, parentCwd: process.cwd(), sessionId: "presentation-e2e", queueRetryMs: 20, maxLogBytes });
+	} } }), { paths, parentCwd: process.cwd(), sessionId: "presentation-e2e", maxLogBytes, ...options });
 	await supervisor.initialize();
 	t.after(async () => { await supervisor.shutdown(); await rm(root, { recursive: true, force: true }); });
 	return { supervisor, paths };
@@ -57,16 +57,14 @@ test("noisy real child yields clean activity, durable answer and independent dia
 	assert.equal(changes, count);
 });
 
-test("queue exposes checkout contention, and cancellation never launches queued work", async (t) => {
+test("independent starts report active state without capacity queues and stop separately", async (t) => {
 	const { supervisor } = await setup(t);
-	const first = await supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000 }) });
-	await waitUntil(() => supervisor.inspect(first.id).state === "running");
-	const second = await supervisor.start({ task: "must remain queued" });
-	await waitUntil(() => supervisor.inspect(second.id).queueReason === "Checkout busy");
-	assert.equal(supervisor.snapshot().filter((run) => run.state === "queued").length, 1);
-	await supervisor.stop(second.id);
-	assert.equal(supervisor.inspect(second.id).state, "cancelled");
-	assert.equal(supervisor.inspect(second.id).startedAt, undefined);
+	const runs = await Promise.all(Array.from({ length: 3 }, () => supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000 }) })));
+	await waitUntil(() => runs.every((run) => supervisor.inspect(run.id).state === "running"));
+	assert.ok(supervisor.snapshot().every((run) => !run.queueReason));
+	await supervisor.stop(runs[0].id);
+	assert.equal(supervisor.inspect(runs[0].id).state, "cancelled");
+	assert.ok(runs.slice(1).every((run) => supervisor.inspect(run.id).state === "running"));
 });
 
 test("all diagnostic channels remain independently bounded during a flood", async (t) => {
@@ -78,15 +76,17 @@ test("all diagnostic channels remain independently bounded during a flood", asyn
 	assert.equal(completed.presentation?.finalAnswer, undefined);
 });
 
-test("shutdown drains in-flight checkout acquisition before returning", async (t) => {
+test("shutdown drains in-flight admission and prevents later launches", async (t) => {
 	for (let attempt = 0; attempt < 4; attempt++) {
 		const { supervisor, paths } = await setup(t, "raw");
 		const run = await supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000 }) });
 		await supervisor.shutdown();
 		assert.ok(isTerminalState(supervisor.inspect(run.id).state));
-		await rm(paths.lockDirectory, { recursive: true, force: true });
+		const recordPath = join(new RunStore(paths, "presentation-e2e").directory, `${run.id}.json`);
+		const record = await readFile(recordPath, "utf8");
 		await new Promise((done) => setTimeout(done, 50));
-		await assert.rejects(() => stat(paths.lockDirectory), { code: "ENOENT" });
+		assert.equal(await readFile(recordPath, "utf8"), record);
+		await assert.rejects(supervisor.start({ task: "must not launch" }), /shutting down/);
 	}
 });
 

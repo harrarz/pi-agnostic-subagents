@@ -20,7 +20,7 @@ const config = parseSupervisorConfig({
 		},
 	},
 });
-const supervisor = new Supervisor(config, { paths, sessionId, parentCwd: cwd, maxConcurrent: 1, maxQueued: 1 });
+const supervisor = new Supervisor(config, { paths, sessionId, parentCwd: cwd });
 await supervisor.initialize();
 const run = await supervisor.start(args[3] ? JSON.parse(args[3]) : { task: JSON.stringify({ mode: "sleep", ms: 60_000 }) });
 const store = new RunStore(paths, sessionId);

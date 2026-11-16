@@ -6,7 +6,7 @@ import type { OutputProtocol, RunPresentation } from "./presentation.js";
 import type { Isolation, WorktreeInfo } from "./worktrees.js";
 
 export type RunState =
-	| "queued"
+	| "queued" // Legacy records only; new runs launch as starting without a scheduler queue.
 	| "starting"
 	| "running"
 	| "stopping"
@@ -24,6 +24,7 @@ export interface StoredRun {
 	label?: string;
 	outputProtocol?: OutputProtocol;
 	presentation?: RunPresentation;
+	/** Read-only compatibility with older queued records. */
 	queueReason?: string;
 	stdoutPath?: string;
 	stderrPath?: string;
@@ -89,7 +90,9 @@ function isStoredRun(value: unknown): value is StoredRun {
 		&& typeof run.logPath === "string"
 		&& typeof run.logBytes === "number"
 		&& typeof run.logTruncated === "boolean"
-		&& typeof run.processToken === "string"
+		&& typeof run.processToken === "string" && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(run.processToken)
+		&& (run.processPid === undefined || (Number.isSafeInteger(run.processPid) && run.processPid > 0))
+		&& (run.processStartIdentity === undefined || (typeof run.processStartIdentity === "string" && run.processStartIdentity.length > 0))
 		&& (run.isolation === undefined || run.isolation === "shared" || run.isolation === "worktree")
 		&& (run.worktree === undefined || isWorktreeInfo(run.worktree))
 		&& (run.worktreeOwnerId === undefined || /^[0-9a-f-]{36}$/.test(run.worktreeOwnerId))
@@ -110,6 +113,7 @@ export class RunStore {
 	readonly directory: string;
 	readonly logsDirectory: string;
 	private readonly records = new Map<string, StoredRun>();
+	readonly recoveryWarnings: string[] = [];
 
 	constructor(paths: SupervisorPaths, readonly sessionId: string) {
 		const sessionDirectory = sessionKey(sessionId);
@@ -122,14 +126,18 @@ export class RunStore {
 		await chmod(this.directory, 0o700);
 		await mkdir(this.logsDirectory, { recursive: true, mode: 0o700 });
 		await chmod(this.logsDirectory, 0o700);
+		this.records.clear();
+		this.recoveryWarnings.length = 0;
 		const files = (await readdir(this.directory)).filter((name) => name.endsWith(".json"));
 		for (const name of files) {
 			const filePath = join(this.directory, name);
-			const raw = JSON.parse(await readFile(filePath, "utf8")) as unknown;
-			if (!isStoredRun(raw) || raw.sessionId !== this.sessionId || `${raw.id}.json` !== name) {
-				throw new Error(`Invalid run metadata file: ${filePath}`);
+			try {
+				const raw = JSON.parse(await readFile(filePath, "utf8")) as unknown;
+				if (!isStoredRun(raw) || raw.sessionId !== this.sessionId || `${raw.id}.json` !== name) throw new Error("Invalid metadata");
+				this.records.set(raw.id, raw);
+			} catch {
+				this.recoveryWarnings.push(`Could not recover run metadata: ${filePath}. File left unchanged; this run's ownership and outcome are unknown. Inspect/repair it manually; no process was signalled from this record.`);
 			}
-			this.records.set(raw.id, raw);
 		}
 	}
 

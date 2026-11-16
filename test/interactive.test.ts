@@ -15,12 +15,12 @@ async function setup(t: TestContext) {
 	await writeFile(join(cwd, "seed"), "seed");
 	const git = (...args: string[]) => execFileSync("git", ["-C", cwd, "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgSign=false", ...args], { encoding: "utf8" });
 	git("add", "seed"); git("commit", "-qm", "seed");
-	const paths = { configDirectory: join(root, "config"), profilesFile: join(root, "config/profiles.json"), runtimeDirectory: join(root, "runtime"), lockDirectory: join(root, "locks") };
+	const paths = { configDirectory: join(root, "config"), profilesFile: join(root, "config/profiles.json"), runtimeDirectory: join(root, "runtime") };
 	const config = parseSupervisorConfig({ defaultProfile: "custom", profiles: { custom: {
 		executable: process.execPath, args: [resolve("test/fixtures/fake-rpc-agent.mjs"), "--session", "{session}", "{modelArgs}"],
 		modelArgs: ["--model", "{model}"], taskTransport: "pi-rpc", outputProtocol: "pi-jsonl",
 	} } });
-	const options = { paths, parentCwd: cwd, sessionId: "interactive", queueRetryMs: 20, stopGraceMs: 100 };
+	const options = { paths, parentCwd: cwd, sessionId: "interactive", stopGraceMs: 100 };
 	const supervisor = new Supervisor(config, options);
 	await supervisor.initialize();
 	t.after(async () => { await supervisor.shutdown(); await rm(root, { recursive: true, force: true }); });

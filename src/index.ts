@@ -58,6 +58,7 @@ export default function agentSupervisorExtension(pi: PiExtensionApi): void {
 			...(ctx.hasUI ? { onRunTerminal: (notice) => ctx.ui.notify(terminalMessage(notice), notice.state === "interrupted" ? "warning" : "info") } : {}),
 		});
 		await supervisor.initialize();
+		if (ctx.hasUI) for (const warning of supervisor.recoveryWarnings) ctx.ui.notify(safeText(warning), "warning");
 		active = { sessionId, cwd: ctx.cwd, supervisor, config, disposeUI: attachRunWidget(ctx, supervisor) };
 		return supervisor;
 	};

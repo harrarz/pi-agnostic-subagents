@@ -21,9 +21,6 @@ const supervisor = new Supervisor(config, {
 	paths,
 	sessionId,
 	parentCwd: cwd,
-	maxConcurrent: 1,
-	maxQueued: 1,
-	queueRetryMs: 20,
 	stopGraceMs: 100,
 });
 await supervisor.initialize();

@@ -21,9 +21,10 @@ function configText(): string {
 			fake: {
 				outputProtocol: "text",
 				executable: process.execPath,
-				args: [fakeAgent, "--model", "{model}", "--reasoning", "{effort}", "--", "{task}"],
+				args: [fakeAgent, "{modelArgs}", "{effortArgs}", "--", "{task}"],
+				modelArgs: ["--model", "{model}"],
+				effortArgs: ["--reasoning", "{effort}"],
 				taskTransport: "argument",
-				defaultModel: "fake/model-steady",
 				defaultEffort: "deep",
 				models: {
 					"fake/model-steady": { efforts: { deep: "max", quick: "low" }, defaultEffort: "deep" },
@@ -166,7 +167,7 @@ test("registers tools/command, starts and inspects a real child in JSON mode, an
 			effort: "deep",
 		}, undefined, undefined, envContext.ctx);
 		const { id, state } = JSON.parse(started.content[0].text);
-		assert.equal(state, "queued");
+		assert.equal(state, "starting");
 		const completed = await waitForRun(tools.get("agent_get"), envContext.ctx, id, "exited");
 		assert.equal(completed.exitCode, 0);
 		assert.equal(completed.model, "fake/model-swift");
@@ -193,7 +194,7 @@ test("registers tools/command, starts and inspects a real child in JSON mode, an
 	}
 });
 
-test("extension launches follow parent changes and persisted settings, not legacy model defaults", async () => {
+test("extension launches follow parent changes and persisted settings", async () => {
 	const { project, cleanup } = await setup();
 	const { pi, tools, handlers } = fakePi();
 	extension(pi as unknown as PiExtensionApi);

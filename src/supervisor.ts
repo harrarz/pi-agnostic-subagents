@@ -8,19 +8,17 @@ import { chmod, lstat, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { SupervisorPaths } from "./config.js";
 import { ensurePrivateSupervisorDirectories } from "./config.js";
-import { CheckoutLockManager, type CheckoutLock } from "./checkout-lock.js";
 import {
 	canonicalizeCwd,
 	getProcessStartIdentity,
 	ProcessPreflightError,
-	isSameOwnedProcess,
+	findOwnedProcesses,
 	isPidAlive,
 	isProcessGroupAlive,
 	processTokenEnvironment,
 	resolveExecutable,
 	spawnConfiguredProcess,
-	terminateProcessGroup,
-	terminateVerifiedProcessGroup,
+	terminateOwnedProcessTree,
 } from "./process.js";
 import { resolveLaunchRecipe, type StartRecipeInput, type SupervisorConfig } from "./profiles.js";
 import { isTerminalState, RunStore, type RunState, type RunView, type RunSummary, type StoredRun } from "./run-store.js";
@@ -53,12 +51,9 @@ export interface SupervisorOptions {
 	paths: SupervisorPaths;
 	sessionId: string;
 	parentCwd: string;
-	maxConcurrent?: number;
-	maxQueued?: number;
 	maxLogBytes?: number;
 	outputTailBytes?: number;
 	stopGraceMs?: number;
-	queueRetryMs?: number;
 	onRunTerminal?: (notice: RunTerminalNotice) => void;
 }
 
@@ -68,12 +63,9 @@ export interface StartResult {
 }
 
 export interface SupervisorLimits {
-	maxConcurrent: number;
-	maxQueued: number;
 	maxLogBytes: number;
 	outputTailBytes: number;
 	stopGraceMs: number;
-	queueRetryMs: number;
 }
 
 interface ProcessClose {
@@ -93,12 +85,11 @@ interface Job {
 	executable: string;
 	args: string[];
 	stdin?: string;
-	checkoutRoot: string;
-	lock?: CheckoutLock;
 	child?: ReturnType<typeof spawnChild>;
 	childStartIdentity?: string;
 	closePromise?: Promise<ProcessClose>;
 	terminationPromise?: Promise<boolean>;
+	cleanupVerified?: boolean;
 	timeout?: NodeJS.Timeout;
 	stopReason?: "cancelled" | "timed_out";
 	cancelRequested: boolean;
@@ -126,10 +117,10 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function validatePositiveInteger(value: number | undefined, fallback: number, name: string, allowZero = false): number {
+function validatePositiveInteger(value: number | undefined, fallback: number, name: string): number {
 	const selected = value ?? fallback;
-	if (!Number.isInteger(selected) || (allowZero ? selected < 0 : selected <= 0)) {
-		throw new SupervisorError("INVALID_CONFIGURATION", `${name} must be a ${allowZero ? "nonnegative" : "positive"} integer`);
+	if (!Number.isInteger(selected) || selected <= 0) {
+		throw new SupervisorError("INVALID_CONFIGURATION", `${name} must be a positive integer`);
 	}
 	return selected;
 }
@@ -137,32 +128,21 @@ function validatePositiveInteger(value: number | undefined, fallback: number, na
 export class Supervisor {
 	readonly limits: SupervisorLimits;
 	private readonly store: RunStore;
-	private readonly locks: CheckoutLockManager;
 	private readonly worktrees: WorktreeManager;
 	private readonly supervisorToken = randomUUID();
-	private supervisorStartIdentity?: string;
 	private readonly jobs = new Map<string, Job>();
-	private readonly queue: Job[] = [];
-	private readonly active = new Set<Job>();
 	private readonly listeners = new Set<() => void>();
 	private initialized = false;
 	private closed = false;
-	private pumping = false;
-	private pumpCompletion?: Deferred<void>;
-	private queueRetry?: NodeJS.Timeout;
 	private admissionTail: Promise<void> = Promise.resolve();
 
 	constructor(private readonly config: SupervisorConfig, private readonly options: SupervisorOptions) {
 		this.limits = {
-			maxConcurrent: validatePositiveInteger(options.maxConcurrent, 2, "maxConcurrent"),
-			maxQueued: validatePositiveInteger(options.maxQueued, 8, "maxQueued", true),
 			maxLogBytes: validatePositiveInteger(options.maxLogBytes, DEFAULT_MAX_LOG_BYTES, "maxLogBytes"),
 			outputTailBytes: validatePositiveInteger(options.outputTailBytes, DEFAULT_OUTPUT_TAIL_BYTES, "outputTailBytes"),
 			stopGraceMs: validatePositiveInteger(options.stopGraceMs, 1200, "stopGraceMs"),
-			queueRetryMs: validatePositiveInteger(options.queueRetryMs, 250, "queueRetryMs"),
 		};
 		this.store = new RunStore(options.paths, options.sessionId);
-		this.locks = new CheckoutLockManager(options.paths);
 		this.worktrees = new WorktreeManager(options.paths);
 	}
 
@@ -173,37 +153,31 @@ export class Supervisor {
 		}
 		await ensurePrivateSupervisorDirectories(this.options.paths);
 		await this.store.initialize();
-		this.supervisorStartIdentity = await getProcessStartIdentity(process.pid);
-		if (!this.supervisorStartIdentity) {
-			throw new SupervisorError("PROCESS_IDENTITY_UNAVAILABLE", "Unable to verify this supervisor process identity");
-		}
 		for (const record of this.store.list()) {
 			if (isTerminalState(record.state)) continue;
-			let cleanupVerified = false;
-			if (await isSameOwnedProcess(record.processPid, record.processStartIdentity, record.processToken)) {
-				cleanupVerified = await terminateVerifiedProcessGroup(
-					record.processPid!,
-					record.processStartIdentity,
-					record.processToken,
-					this.limits.stopGraceMs,
-				);
-			}
+			const cleanupVerified = await terminateOwnedProcessTree(
+				record.processPid, record.processStartIdentity, record.processToken, this.limits.stopGraceMs,
+			);
 			if (record.worktree) {
 				record.worktree.state = record.worktree.state === "ready" ? "retained" : "failed";
 				record.worktree.note += " Owner was lost; any workspace and branch are preserved for manual inspection.";
 			}
 			record.state = "interrupted";
+			delete record.queueReason;
 			record.endedAt = new Date().toISOString();
 			record.error = {
 				code: "OWNER_RESTARTED",
 				message: cleanupVerified
 					? "The previous supervisor stopped its verified child during recovery; task outcome is unknown."
-					: "The previous supervisor ended without a verifiable terminal process outcome; no process was signalled.",
+					: "Recovery could not fully verify cleanup or the previous process outcome. Unverified processes were not signalled.",
 			};
-			await this.store.persist(record);
+			try { await this.store.persist(record); }
+			catch { this.store.recoveryWarnings.push(`Could not persist recovered run ${record.id}; inspect ${this.store.directory}. Other valid runs were still reconciled.`); }
 		}
 		this.initialized = true;
 	}
+
+	get recoveryWarnings(): string[] { return [...this.store.recoveryWarnings]; }
 
 	/** Invalidation subscription; consumers pull log-free, by-value snapshots. */
 	subscribe(listener: () => void): () => void {
@@ -233,7 +207,7 @@ export class Supervisor {
 		}
 	}
 
-	async start(input: StartInput): Promise<StartResult> { return this.enqueue(input); }
+	async start(input: StartInput): Promise<StartResult> { return this.admit(input); }
 
 	/** Human-directed fresh execution; never reuses a prior conversation/worktree. */
 	async rerun(id: string, changes: Partial<StartInput> = {}): Promise<StartResult> {
@@ -255,7 +229,7 @@ export class Supervisor {
 		await this.get(id);
 		const run = this.latestConversation(this.store.get(id)!);
 		if (!this.capabilities(run).followUp) throw new SupervisorError("FOLLOW_UP_UNAVAILABLE", "No safely settled, saved conversation is available for follow-up");
-		return this.enqueue({ task: message, label: run.label, profile: run.profile, model: run.model, effort: run.effortAlias,
+		return this.admit({ task: message, label: run.label, profile: run.profile, model: run.model, effort: run.effortAlias,
 			cwd: run.worktree?.sourceCwd ?? run.cwd, isolation: run.isolation, timeoutMs: run.timeoutMs }, run);
 	}
 
@@ -273,14 +247,14 @@ export class Supervisor {
 		const latest = this.latestConversation(run);
 		return {
 			steer: !this.closed && run.state === "running" && Boolean(this.jobs.get(run.id)?.rpc?.canSteer),
-			followUp: !this.closed && Boolean(run.control && latest.state === "exited" && latest.exitCode === 0 && !latest.error
+			followUp: !this.closed && this.store.recoveryWarnings.length === 0 && Boolean(run.control && latest.state === "exited" && latest.exitCode === 0 && !latest.error
 				&& latest.presentation?.finalAnswer && existsSync(latest.control!.sessionPath)
 				&& this.config.profiles[latest.profile]?.taskTransport === "pi-rpc"
 				&& (!latest.worktree || latest.worktree.state === "retained")),
 		};
 	}
 
-	private async enqueue(input: StartInput, continuation?: StoredRun): Promise<StartResult> {
+	private async admit(input: StartInput, continuation?: StoredRun): Promise<StartResult> {
 		this.assertInitialized();
 		const recordId = randomUUID();
 		const sessionPath = continuation?.control?.sessionPath ?? join(this.options.paths.runtimeDirectory, "sessions", `${recordId}.jsonl`);
@@ -318,24 +292,16 @@ export class Supervisor {
 
 		return this.withAdmission(async () => {
 			if (this.closed) throw new SupervisorError("SUPERVISOR_CLOSED", "This supervisor session is shutting down");
-			let reservedLock: CheckoutLock | undefined;
 			if (continuation) {
 				if (this.latestConversation(continuation).id !== continuation.id || !this.capabilities(continuation).followUp) throw new SupervisorError("CONVERSATION_BUSY", "Conversation changed or is busy; no follow-up was started");
 				const expected = join(this.options.paths.runtimeDirectory, "sessions", `${continuation.control!.conversationId}.jsonl`);
 				if (sessionPath !== expected || !(await lstat(sessionPath)).isFile()) throw new SupervisorError("SESSION_IDENTITY", "Saved session identity changed; refusing continuation");
 			}
-			if (this.queue.length >= this.limits.maxQueued && (this.active.size >= this.limits.maxConcurrent || this.queue.length > 0)) throw new SupervisorError("CAPACITY_FULL", "Supervisor queue is at capacity");
 			let worktree: WorktreeInfo | undefined = continuation?.worktree ? structuredClone(continuation.worktree) : undefined;
 			if (isolation === "worktree" && !continuation) {
 				try { worktree = await this.worktrees.plan(canonical.checkoutRoot, canonical.cwd, recordId); }
 				catch (error) { if (error instanceof WorktreeError) throw new SupervisorError(error.code, error.message); throw error; }
 			}
-			const checkoutRoot = worktree?.path ?? canonical.checkoutRoot;
-			if (this.queue.length >= this.limits.maxQueued) {
-				reservedLock = await this.locks.tryAcquire(checkoutRoot, this.lockOwner(recordId));
-				if (!reservedLock) throw new SupervisorError("CAPACITY_FULL", "Supervisor queue is at capacity and the checkout is already locked");
-			}
-
 			const processToken = randomUUID();
 			const outputProtocol = this.config.profiles[recipe.profile].outputProtocol ?? "raw";
 			const presenter = new OutputPresenter(outputProtocol);
@@ -349,7 +315,6 @@ export class Supervisor {
 				label: input.label?.trim() ?? input.task.replace(/\s+/g, " ").trim().slice(0, 60),
 				outputProtocol,
 				presentation: presenter.state,
-				queueReason: "Waiting for admission",
 				sessionId: this.options.sessionId,
 				supervisorToken: this.supervisorToken,
 				profile: recipe.profile,
@@ -357,7 +322,7 @@ export class Supervisor {
 				...(recipe.effort !== undefined ? { effort: recipe.effort, effortAlias: recipe.effortAlias } : {}),
 				task: input.task,
 				cwd: canonical.cwd,
-				state: "queued",
+				state: "starting",
 				createdAt: new Date().toISOString(),
 				processToken,
 				...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
@@ -368,8 +333,6 @@ export class Supervisor {
 				executable,
 				args: recipe.args,
 				...(recipe.stdin !== undefined ? { stdin: recipe.stdin } : {}),
-				checkoutRoot,
-				...(reservedLock ? { lock: reservedLock } : {}),
 				cancelRequested: false,
 				finished: false,
 				completion: deferred<void>(),
@@ -383,13 +346,14 @@ export class Supervisor {
 			} catch (error) {
 				this.jobs.delete(record.id);
 				await this.store.discard(record).catch(() => undefined);
-				if (reservedLock) await reservedLock.release();
 				throw new SupervisorError("RUN_STORAGE_FAILED", errorMessage(error));
 			}
-			this.queue.push(job);
+			const started = { id: record.id, state: record.state };
 			this.changed();
-			this.requestPump();
-			return { id: record.id, state: record.state };
+			void this.launch(job).catch(async (error) => {
+				if (!job.finished) await this.finish(job, "launch_failed", { code: "LAUNCH_FAILED", message: errorMessage(error) });
+			}).finally(() => { job.completion.resolve(); });
+			return started;
 		});
 	}
 
@@ -431,6 +395,7 @@ export class Supervisor {
 
 	/** Human-only, non-forced cleanup. Never called automatically on completion. */
 	async removeWorktree(id: string): Promise<RunView> {
+		if (this.store.recoveryWarnings.length) throw new SupervisorError("WORKTREE_UNCERTAIN", "Some run history could not be recovered; inspect/repair it before workspace cleanup. No files were deleted.");
 		await this.get(id);
 		return this.withAdmission(async () => {
 			if (this.closed) throw new SupervisorError("SUPERVISOR_CLOSED", "This supervisor session is shutting down");
@@ -440,36 +405,28 @@ export class Supervisor {
 			const related = this.store.list().filter((other) => other.worktree?.path === record.worktree!.path);
 			if (related.some((other) => other.state === "interrupted" || other.worktree?.state === "failed")) throw new SupervisorError("WORKTREE_UNCERTAIN", "Workspace setup or process outcome is uncertain; inspect/recover it with Git manually. No files were deleted.");
 			if (related.some((other) => other.processPid && (isPidAlive(other.processPid) || isProcessGroupAlive(other.processPid)))) throw new SupervisorError("WORKTREE_ACTIVE", "A process/group may still be live; refusing workspace removal");
-			const lock = await this.locks.tryAcquire(record.worktree.path, this.lockOwner(record.id));
-			if (!lock) throw new SupervisorError("WORKTREE_BUSY", "Worktree is locked by another supervised run");
-			try {
-				await this.worktrees.remove(record.worktree, record.worktreeOwnerId ?? record.id);
-				for (const other of this.store.list()) {
-					if (other.worktree?.path === record.worktree.path) { other.worktree = structuredClone(record.worktree); await this.store.persist(other); }
-				}
-				this.changed();
-				return this.store.view(record, this.limits.outputTailBytes);
-			} finally { await lock.release(); }
+			for (const other of related.filter((run) => run.processPid)) {
+				const remaining = await findOwnedProcesses(other.processToken);
+				if (!remaining) throw new SupervisorError("WORKTREE_UNCERTAIN", "Could not inspect owned descendants; no files were deleted.");
+				if (remaining.length) throw new SupervisorError("WORKTREE_ACTIVE", "Owned descendants are still live; refusing workspace removal");
+			}
+			await this.worktrees.remove(record.worktree, record.worktreeOwnerId ?? record.id);
+			for (const other of this.store.list()) {
+				if (other.worktree?.path === record.worktree.path) { other.worktree = structuredClone(record.worktree); await this.store.persist(other); }
+			}
+			this.changed();
+			return this.store.view(record, this.limits.outputTailBytes);
 		});
 	}
 
 	async shutdown(): Promise<void> {
 		if (!this.initialized || this.closed) return;
 		this.closed = true;
-		if (this.queueRetry) clearTimeout(this.queueRetry);
-		this.queueRetry = undefined;
-		// Admission and checkout acquisition may still be awaiting filesystem I/O.
-		// Drain both before teardown so no late lock writes outlive shutdown.
+		// Admission may still be persisting a newly accepted run.
 		await this.admissionTail;
-		await this.pumpCompletion?.promise;
-		const pending = [...this.jobs.values()].filter((job) => !isTerminalState(job.record.state));
-		await Promise.all(pending.map(async (job) => {
-			if (job.record.state === "queued") {
-				await this.cancelQueued(job);
-			} else {
-				await this.requestStop(job, "cancelled");
-				await job.completion.promise;
-			}
+		await Promise.all([...this.jobs.values()].map(async (job) => {
+			if (!isTerminalState(job.record.state)) await this.requestStop(job, "cancelled");
+			await job.completion.promise;
 		}));
 		this.listeners.clear();
 	}
@@ -481,11 +438,6 @@ export class Supervisor {
 		if (job.timeout) clearTimeout(job.timeout);
 		job.timeout = undefined;
 
-		if (job.record.state === "queued") {
-			await this.cancelQueued(job);
-			return;
-		}
-
 		if (job.record.state !== "stopping") {
 			job.record.state = "stopping";
 			await this.store.persist(job.record);
@@ -493,64 +445,29 @@ export class Supervisor {
 		}
 		const childPid = job.child?.pid;
 		if (childPid && !job.terminationPromise) {
-			job.terminationPromise = terminateProcessGroup(childPid, this.limits.stopGraceMs, true);
+			job.terminationPromise = terminateOwnedProcessTree(childPid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
 		}
-	}
-
-	private async cancelQueued(job: Job): Promise<void> {
-		if (job.finished) return;
-		this.removeFromQueue(job);
-		job.cancelRequested = true;
-		job.stopReason ??= "cancelled";
-		if (job.lock) {
-			await job.lock.release();
-			job.lock = undefined;
-		}
-		await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was cancelled before launch" });
-		this.requestPump();
 	}
 
 	private async launch(job: Job): Promise<void> {
 		if (job.finished) return;
 		let drainTasks: Promise<void>[] = [];
-		delete job.record.queueReason;
-		this.changed();
 		try {
-			if (!job.lock) {
-				job.record.state = "starting";
-				await this.store.persist(job.record);
-				if (job.cancelRequested) {
-					await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was cancelled before process creation" });
-					return;
-				}
-				job.lock = await this.locks.tryAcquire(job.checkoutRoot, this.lockOwner(job.record.id));
-				if (!job.lock) {
-					// A lock can disappear between queue selection and acquisition. Return the job to FIFO queue.
-					job.record.state = "queued";
-					await this.store.persist(job.record);
-					this.queue.unshift(job);
-					return;
-				}
-			} else {
-				job.record.state = "starting";
-				await this.store.persist(job.record);
-			}
-
-			if (job.cancelRequested) {
+			if (job.cancelRequested || this.closed) {
 				await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was cancelled before process creation" });
 				return;
 			}
 
 			if (job.record.worktree) {
-				job.record.queueReason = "Preparing isolated worktree";
+				job.presenter.state.activity = "Preparing isolated worktree";
 				this.changed();
 				job.record.cwd = job.record.control?.continuedFrom
 					? await this.worktrees.resume(job.record.worktree, job.record.worktreeOwnerId!)
 					: await this.worktrees.prepare(job.record.worktree, job.record.id);
-				delete job.record.queueReason;
+				delete job.presenter.state.activity;
 				await this.store.persist(job.record);
 				this.changed();
-				if (job.cancelRequested) {
+				if (job.cancelRequested || this.closed) {
 					await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was cancelled during workspace preparation; worktree retained" });
 					return;
 				}
@@ -559,6 +476,10 @@ export class Supervisor {
 			if (job.record.control) {
 				await mkdir(dirname(job.record.control.sessionPath), { recursive: true, mode: 0o700 });
 				await chmod(dirname(job.record.control.sessionPath), 0o700);
+			}
+			if (job.cancelRequested || this.closed) {
+				await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was cancelled before process creation" });
+				return;
 			}
 			const child = spawnConfiguredProcess(job.executable, job.args, {
 				cwd: job.record.cwd,
@@ -578,7 +499,7 @@ export class Supervisor {
 				child.once("exit", (exitCode, signal) => resolveExit({ exitCode, signal }));
 			}).then(async () => {
 				if (process.platform === "win32" || !child.pid) return true;
-				job.terminationPromise ??= terminateProcessGroup(child.pid, this.limits.stopGraceMs, true);
+				job.terminationPromise ??= terminateOwnedProcessTree(child.pid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
 				return job.terminationPromise;
 			});
 			let spawnError: Error | undefined;
@@ -601,11 +522,9 @@ export class Supervisor {
 				// Don't signal until the process group has been created and its PID
 				// identity recorded below. Launch will handle an earlier EPIPE.
 				if (job.childStartIdentity && child.pid) {
-					job.terminationPromise ??= terminateProcessGroup(child.pid, this.limits.stopGraceMs, true);
+					job.terminationPromise ??= terminateOwnedProcessTree(child.pid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
 				}
 			});
-			if (job.stdin !== undefined) child.stdin?.end(job.stdin, "utf8");
-			else if (!job.rpc) child.stdin?.end();
 
 			try {
 				await spawnResult;
@@ -625,9 +544,19 @@ export class Supervisor {
 			job.record.processPid = child.pid;
 			job.childStartIdentity = await getProcessStartIdentity(child.pid);
 			job.record.processStartIdentity = job.childStartIdentity;
-			if (!job.childStartIdentity) {
-				job.terminationPromise = terminateProcessGroup(child.pid, this.limits.stopGraceMs, true);
-				await job.terminationPromise;
+			// An argv task may finish before the OS identity lookup returns. Only a
+			// locally observed exit can take this path; live/unobserved processes and
+			// unsent stdin/RPC tasks still fail closed. Finalization below continues
+			// to require verified group/token-owned descendant cleanup.
+			if (!job.childStartIdentity && job.stdin === undefined && !job.rpc) {
+				await new Promise<void>((resolveExitEvent) => setImmediate(resolveExitEvent));
+			}
+			const exitedBeforeIdentity = !job.childStartIdentity && job.stdin === undefined && !job.rpc
+				&& (child.exitCode !== null || child.signalCode !== null);
+			if (!job.childStartIdentity && !exitedBeforeIdentity) {
+				if (job.stdin !== undefined) job.stdinError ??= new Error("Task stdin was not sent because the child identity could not be verified");
+				job.terminationPromise ??= terminateOwnedProcessTree(child.pid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
+				job.cleanupVerified = await job.terminationPromise;
 				await job.closePromise;
 				await Promise.all(drainTasks);
 				await this.finish(job, "interrupted", job.stdinError
@@ -635,32 +564,37 @@ export class Supervisor {
 					: { code: "PROCESS_IDENTITY_UNAVAILABLE", message: "Could not verify the spawned process identity; it was terminated without recording task success" });
 				return;
 			}
-			await job.lock?.setChild(child.pid, job.childStartIdentity, job.record.processToken);
 			job.record.startedAt = new Date().toISOString();
 			job.record.state = job.stopReason ? "stopping" : "running";
 			await this.store.persist(job.record);
 			this.changed();
 			if (job.stdinError || job.stopReason) {
-				job.terminationPromise ??= terminateProcessGroup(child.pid, this.limits.stopGraceMs, true);
-			} else if (job.record.timeoutMs !== undefined) {
+				job.terminationPromise ??= terminateOwnedProcessTree(child.pid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
+			} else if (!exitedBeforeIdentity && job.record.timeoutMs !== undefined) {
 				job.timeout = setTimeout(() => {
 					void this.requestStop(job, "timed_out").catch(() => undefined);
 				}, job.record.timeoutMs);
 				job.timeout.unref();
 			}
 
-			if (job.rpc && !job.stopReason && !job.stdinError) {
-				void job.rpc.prompt(job.record.task).catch((error: Error) => {
-					job.stdinError ??= error;
-					job.terminationPromise ??= terminateProcessGroup(child.pid!, this.limits.stopGraceMs, true);
-				});
+			if (!exitedBeforeIdentity && !job.stopReason && !job.stdinError) {
+				if (job.rpc) {
+					void job.rpc.prompt(job.record.task).catch((error: Error) => {
+						job.stdinError ??= error;
+						job.terminationPromise ??= terminateOwnedProcessTree(child.pid!, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
+					});
+				} else {
+					// A stdin reader must not consume/exit before its ownership checkpoint.
+					if (job.stdin !== undefined) child.stdin?.end(job.stdin, "utf8");
+					else child.stdin?.end();
+				}
 			}
 			const close = await job.closePromise;
 			if (job.record.control && existsSync(job.record.control.sessionPath)) await chmod(job.record.control.sessionPath, 0o600);
 			if (job.timeout) clearTimeout(job.timeout);
 			job.timeout = undefined;
 			await Promise.all(drainTasks);
-			const cleanupObserved = await cleanupAfterExit;
+			const cleanupObserved = job.cleanupVerified = await cleanupAfterExit;
 			if (job.logError) job.record.error = { code: "LOG_IO", message: job.logError };
 			if (!cleanupObserved) {
 				await this.finish(job, "interrupted", job.stdinError
@@ -682,8 +616,8 @@ export class Supervisor {
 			}
 		} catch (error) {
 			if (job.child?.pid && process.platform !== "win32") {
-				job.terminationPromise ??= terminateProcessGroup(job.child.pid, this.limits.stopGraceMs, true);
-				await job.terminationPromise.catch(() => false);
+				job.terminationPromise ??= terminateOwnedProcessTree(job.child.pid, job.childStartIdentity, job.record.processToken, this.limits.stopGraceMs, true);
+				job.cleanupVerified = await job.terminationPromise.catch(() => false);
 			}
 			if (job.child && job.closePromise) await job.closePromise.catch(() => undefined);
 			await Promise.all(drainTasks);
@@ -697,10 +631,6 @@ export class Supervisor {
 		} finally {
 			if (job.timeout) clearTimeout(job.timeout);
 			job.timeout = undefined;
-			if (job.lock) {
-				await job.lock.release().catch(() => undefined);
-				job.lock = undefined;
-			}
 		}
 	}
 
@@ -708,14 +638,9 @@ export class Supervisor {
 		if (job.finished) return;
 		let terminalState = state;
 		let terminalError = error;
-		if (job.lock) {
-			try {
-				await job.lock.release();
-				job.lock = undefined;
-			} catch (releaseError) {
-				terminalState = "interrupted";
-				terminalError = { code: "CHECKOUT_LOCK_RELEASE", message: `Could not release checkout lock: ${errorMessage(releaseError)}` };
-			}
+		if (job.child?.pid && !job.cleanupVerified) {
+			terminalState = "interrupted";
+			terminalError = error ?? { code: "CLEANUP_UNVERIFIED", message: "Owned process cleanup could not be verified; inspect the run's processes manually." };
 		}
 		if (job.record.worktree?.state === "ready") job.record.worktree.state = "retained";
 		else if (job.record.worktree?.state === "pending") job.record.worktree.state = "not_created";
@@ -777,95 +702,7 @@ export class Supervisor {
 		}
 	}
 
-	private async requestPump(): Promise<void> {
-		if (!this.initialized || this.closed || this.pumping) return;
-		this.pumping = true;
-		const completion = deferred<void>();
-		this.pumpCompletion = completion;
-		try {
-			while (this.active.size < this.limits.maxConcurrent && this.queue.length > 0 && !this.closed) {
-				for (let index = this.queue.length - 1; index >= 0; index--) {
-					if (this.queue[index].finished || this.queue[index].cancelRequested) this.queue.splice(index, 1);
-				}
-				if (this.queue.length === 0) break;
-				let selectedIndex = -1;
-				let selectedLock: CheckoutLock | undefined;
-				for (let index = 0; index < this.queue.length; index++) {
-					const candidate = this.queue[index];
-					if (candidate.cancelRequested || candidate.finished) continue;
-					if (candidate.lock) {
-						selectedIndex = index;
-						selectedLock = candidate.lock;
-						break;
-					}
-					const lock = await this.locks.tryAcquire(candidate.checkoutRoot, this.lockOwner(candidate.record.id));
-					if (!lock && candidate.record.queueReason !== "Checkout busy") {
-						candidate.record.queueReason = "Checkout busy";
-						this.changed();
-					}
-					if (lock) {
-						if (candidate.cancelRequested || candidate.finished || this.closed) {
-							await lock.release();
-							continue;
-						}
-						selectedIndex = index;
-						selectedLock = lock;
-						candidate.lock = lock;
-						break;
-					}
-				}
-				if (selectedIndex < 0) break;
-				const [job] = this.queue.splice(selectedIndex, 1);
-				if (!job || !selectedLock) continue;
-				this.active.add(job);
-				void this.launch(job).catch(async (error) => {
-					if (!job.finished) await this.finish(job, "launch_failed", { code: "LAUNCH_FAILED", message: errorMessage(error) });
-				}).finally(() => {
-					this.active.delete(job);
-					job.completion.resolve();
-					this.requestPump();
-				});
-			}
-		} finally {
-			this.pumping = false;
-			if (this.active.size >= this.limits.maxConcurrent) {
-				for (const job of this.queue) job.record.queueReason = "Concurrency limit";
-				this.changed();
-			}
-			if (this.queue.length === 0) {
-				if (this.queueRetry) clearTimeout(this.queueRetry);
-				this.queueRetry = undefined;
-			} else {
-				this.scheduleQueueRetry();
-			}
-			completion.resolve();
-		}
-	}
-
-	private scheduleQueueRetry(): void {
-		if (this.queueRetry || this.closed) return;
-		this.queueRetry = setTimeout(() => {
-			this.queueRetry = undefined;
-			this.requestPump();
-		}, this.limits.queueRetryMs);
-		this.queueRetry.unref();
-	}
-
-	private removeFromQueue(job: Job): void {
-		const index = this.queue.indexOf(job);
-		if (index >= 0) this.queue.splice(index, 1);
-	}
-
-	private lockOwner(runId: string) {
-		if (!this.supervisorStartIdentity) throw new SupervisorError("NOT_INITIALIZED", "Supervisor process identity is unavailable");
-		return {
-			runId,
-			supervisorToken: this.supervisorToken,
-			supervisorPid: process.pid,
-			supervisorStartIdentity: this.supervisorStartIdentity,
-		};
-	}
-
+	/** Orders record/identity bookkeeping only; never waits for another run to finish. */
 	private async withAdmission<T>(action: () => Promise<T>): Promise<T> {
 		const previous = this.admissionTail;
 		let release!: () => void;

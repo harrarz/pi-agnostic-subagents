@@ -18,20 +18,21 @@ export function browserActions(run: RunSummary): BrowserAction[] {
 	return actions;
 }
 export function actionLabel(action: BrowserAction, run: RunSummary): string {
-	return action === "stop" && run.state === "queued" ? "Cancel" : actionLabels[action];
+	return action === "stop" && (run.state === "starting" || run.state === "queued") ? "Cancel" : actionLabels[action];
 }
 
 async function editRerun(ctx: PiCommandContext, run: RunSummary): Promise<Partial<StartInput> | undefined> {
 	const draft: Partial<StartInput> = { task: run.task, model: run.model, effort: run.effortAlias, timeoutMs: run.timeoutMs, isolation: run.isolation ?? "shared" };
 	for (;;) {
-		const choices = ["Run", `Task: ${oneLine(draft.task!, 70)}`, `Model: ${draft.model ?? "CLI configuration"}`, `Effort: ${draft.effort ?? "CLI configuration"}`, `Timeout (ms): ${draft.timeoutMs ?? "none"}`, `Isolation: ${draft.isolation}`, "Cancel"];
+		const choices = ["Run", `Task: ${oneLine(draft.task!, 70)}`, `Model: ${draft.model ?? "CLI configuration"}`, `Effort: ${draft.effort ?? "CLI configuration"}`, `Timeout (ms): ${draft.timeoutMs ?? "none"}`, `Isolation: ${draft.isolation === "shared" ? "shared (concurrent writes)" : "worktree"}`, "Cancel"];
 		const choice = await ctx.ui.select("Rerun with changes · fresh conversation/workspace", choices.map(safeText));
 		if (!choice || choice === "Cancel") return;
 		const index = choices.map(safeText).indexOf(choice);
 		if (index === 0) return draft;
 		if (index === 5) {
-			const isolation = await ctx.ui.select("Checkout isolation", ["shared", "worktree"]);
-			if (isolation === "shared" || isolation === "worktree") draft.isolation = isolation;
+			const isolation = await ctx.ui.select("Checkout isolation", ["shared (concurrent writes)", "worktree"]);
+			if (isolation === "shared (concurrent writes)") draft.isolation = "shared";
+			else if (isolation === "worktree") draft.isolation = "worktree";
 			continue;
 		}
 		const field = (["task", "model", "effort", "timeoutMs"] as const)[index - 1];
@@ -64,7 +65,7 @@ export async function executeBrowserRequest(ctx: PiCommandContext, supervisor: S
 	if (request.action === "rerun" || request.action === "editRerun") {
 		const changes = request.action === "editRerun" ? await editRerun(ctx, run) : {};
 		if (!changes) return;
-		if (!await ctx.ui.confirm("Start fresh agent run?", safeText(`Same resolved settings unless edited. No conversation or previous worktree changes are copied.${(changes.isolation ?? run.isolation) === "worktree" ? " New worktree starts from current committed HEAD; previous worktree is retained." : " Uses the current shared checkout."}`))) return;
+		if (!await ctx.ui.confirm("Start fresh agent run?", safeText(`Same resolved settings unless edited. No conversation or previous worktree changes are copied.${(changes.isolation ?? run.isolation) === "worktree" ? " New worktree starts from current committed HEAD; previous worktree is retained." : " Uses the current shared folder with concurrent writes; overlapping edits can overwrite each other."}`))) return;
 		return (await supervisor.rerun(run.id, changes)).id;
 	}
 }

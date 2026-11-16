@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import { parseSupervisorConfig, resolveLaunchRecipe } from "../src/profiles.js";
+import { loadBundledSupervisorConfig } from "../src/config.js";
+import { resolveLaunchRecipe } from "../src/profiles.js";
 
 const enabled = process.env.PI_AGENT_SUPERVISOR_CLI_SMOKE === "1";
 
@@ -24,11 +24,11 @@ function findModel(value: unknown, slug: string): Record<string, any> | undefine
 }
 
 test("offline Pi/Codex catalog smoke-checks match direct model IDs and effort support (no task sent)", { skip: !enabled }, async () => {
-	const config = parseSupervisorConfig(JSON.parse(await readFile(new URL("../profiles/verified.json", import.meta.url), "utf8")));
+	const config = loadBundledSupervisorConfig();
 	const piBin = process.env.PI_BIN ?? "pi";
 	const codexBin = process.env.CODEX_BIN ?? "codex";
 
-	for (const [modelId, effort] of [["openai-codex/gpt-6-luna", "max"], ["openai-codex/gpt-6-sol", "high"]] as const) {
+	for (const [modelId, effort] of [["openai-codex/gpt-6-luna", "max"], ["openai-codex/gpt-6.1-sol", "high"]] as const) {
 		const recipe = resolveLaunchRecipe(config, { profile: "pi", model: modelId, effort, task: "offline model-selection smoke test" });
 		const output = execFileSync(piBin, [
 			"--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--no-skills",
@@ -74,7 +74,7 @@ test("Claude Code profile flags parse in help mode without submitting a task", {
 	assert.ifError(version.error);
 	assert.equal(version.status, 0, version.stderr);
 
-	const config = parseSupervisorConfig(JSON.parse(await readFile(new URL("../profiles/verified.json", import.meta.url), "utf8")));
+	const config = loadBundledSupervisorConfig();
 	const recipe = resolveLaunchRecipe(config, { profile: "claude-code", model: "sonnet", task: "offline flag smoke test" });
 	assert.equal(recipe.taskTransport, "stdin");
 	assert.equal(recipe.stdin, "offline flag smoke test");

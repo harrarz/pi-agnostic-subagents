@@ -19,8 +19,6 @@ export interface LaunchProfile {
 	effortArgs?: string[];
 	modelFormat?: "qualified" | "id";
 	parentProviders?: string[];
-	/** Legacy compatibility only; extension launches select parent/user models. */
-	defaultModel?: string;
 	defaultEffort?: string;
 }
 
@@ -50,7 +48,7 @@ export interface LaunchRecipe {
 
 const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const PLACEHOLDERS = new Set(["task", "model", "effort", "modelArgs", "effortArgs", "session"]);
+const PLACEHOLDERS = new Set(["task", "modelArgs", "effortArgs", "session"]);
 const SHELL_EXPANSION = /\$\(|\$\{|`|\$[A-Za-z_]/;
 
 export class ProfileConfigurationError extends Error {
@@ -146,9 +144,9 @@ function parseArgumentGroup(value: unknown, name: "model" | "effort", path: stri
 
 function parseProfile(value: unknown, path: string): LaunchProfile {
 	const record = requireRecord(value, path);
-	assertOnlyKeys(record, ["executable", "args", "taskTransport", "environment", "models", "defaultModel", "defaultEffort", "outputProtocol", "modelArgs", "effortArgs", "modelFormat", "parentProviders"], path);
-	if (record.outputProtocol !== undefined && (typeof record.outputProtocol !== "string" || !["raw", "text", "pi-jsonl"].includes(record.outputProtocol))) {
-		fail(`${path}.outputProtocol`, "expected raw, text, or pi-jsonl");
+	assertOnlyKeys(record, ["executable", "args", "taskTransport", "environment", "models", "defaultEffort", "outputProtocol", "modelArgs", "effortArgs", "modelFormat", "parentProviders"], path);
+	if (record.outputProtocol !== undefined && (typeof record.outputProtocol !== "string" || !["raw", "text", "pi-jsonl", "codex-jsonl"].includes(record.outputProtocol))) {
+		fail(`${path}.outputProtocol`, "expected raw, text, pi-jsonl, or codex-jsonl");
 	}
 
 	const modelArgs = parseArgumentGroup(record.modelArgs, "model", `${path}.modelArgs`);
@@ -188,7 +186,6 @@ function parseProfile(value: unknown, path: string): LaunchProfile {
 	const count = (placeholder: string) => args.reduce((total, arg) => total + [...arg.matchAll(new RegExp(`\\{${placeholder}\\}`, "g"))].length, 0);
 	for (const [name, group] of [["model", modelArgs], ["effort", effortArgs]] as const) {
 		if (count(`${name}Args`) !== (group ? 1 : 0)) fail(`${path}.args`, `${name}Args requires exactly one matching group slot`);
-		if (group && count(name)) fail(`${path}.args`, `cannot mix {${name}} and {${name}Args}`);
 	}
 	const taskCount = count("task");
 	if (transport === "argument" && taskCount !== 1) {
@@ -199,9 +196,6 @@ function parseProfile(value: unknown, path: string): LaunchProfile {
 	}
 	if (count("session") !== (transport === "pi-rpc" ? 1 : 0)) fail(`${path}.args`, "pi-rpc requires exactly one whole-argument {session}; other transports forbid it");
 	if (transport === "pi-rpc" && record.outputProtocol !== "pi-jsonl") fail(`${path}.outputProtocol`, "pi-rpc requires pi-jsonl output");
-	for (const placeholder of ["model", "effort"]) {
-		if (count(placeholder) > 1) fail(`${path}.args`, `placeholder {${placeholder}} may appear at most once`);
-	}
 
 	let models: Record<string, ModelProfile> | undefined;
 	if (record.models !== undefined) {
@@ -211,37 +205,19 @@ function parseProfile(value: unknown, path: string): LaunchProfile {
 			models[modelId] = parseModelProfile(model, `${path}.models.${modelId}`);
 		}
 	}
-	const defaultModel = record.defaultModel === undefined ? undefined : requireModelId(record.defaultModel, `${path}.defaultModel`);
 	const defaultEffort = record.defaultEffort === undefined ? undefined : requireName(record.defaultEffort, `${path}.defaultEffort`);
 	const environment = record.environment === undefined ? undefined : parseStringMap(record.environment, `${path}.environment`, ENVIRONMENT_NAME);
 
 	if (models && Object.keys(models).length === 0) fail(`${path}.models`, "must contain at least one model ID");
-	if (models && !defaultModel && !modelArgs) fail(`${path}.defaultModel`, "is required when models are configured");
-	if (!models && defaultModel) fail(`${path}.defaultModel`, "requires a models map");
-	if (defaultModel && !models?.[defaultModel]) fail(`${path}.defaultModel`, `unknown model ID ${JSON.stringify(defaultModel)}`);
-	if (!modelArgs && Boolean(models) !== (count("model") === 1)) {
-		fail(`${path}.args`, models ? 'models require exactly one "{model}" argv placeholder' : '"{model}" requires a models map');
-	}
+	if (models && !modelArgs) fail(`${path}.modelArgs`, "models require a model argument group");
 
 	const hasEffortMappings = Boolean(defaultEffort) || Object.values(models ?? {}).some((model) => Boolean(model.efforts));
-	if (hasEffortMappings && count("effort") !== 1 && !effortArgs) {
-		fail(`${path}.args`, 'configured efforts require exactly one "{effort}" argv placeholder');
-	}
-	if (!hasEffortMappings && count("effort") !== 0) {
-		fail(`${path}.args`, '"{effort}" requires configured effort mappings');
-	}
+	if (hasEffortMappings && !effortArgs) fail(`${path}.effortArgs`, "configured efforts require an effort argument group");
 	if (defaultEffort && !models) fail(`${path}.defaultEffort`, "requires configured models");
 	if (defaultEffort) {
 		for (const [modelId, model] of Object.entries(models ?? {})) {
 			if (!model.defaultEffort && !model.efforts?.[defaultEffort]) {
 				fail(`${path}.defaultEffort`, `fallback effort ${JSON.stringify(defaultEffort)} is not configured for model ${JSON.stringify(modelId)}`);
-			}
-		}
-	}
-	if (count("effort") === 1) {
-		for (const [modelId, model] of Object.entries(models ?? {})) {
-			if (!model.defaultEffort && !defaultEffort) {
-				fail(`${path}.models.${modelId}`, "an effort argv placeholder requires a default effort for every model");
 			}
 		}
 	}
@@ -257,17 +233,17 @@ function parseProfile(value: unknown, path: string): LaunchProfile {
 		...(parentProviders ? { parentProviders } : {}),
 		...(environment ? { environment } : {}),
 		...(models ? { models } : {}),
-		...(defaultModel ? { defaultModel } : {}),
 		...(defaultEffort ? { defaultEffort } : {}),
 	};
 }
 
-export function parseSupervisorConfig(value: unknown): SupervisorConfig {
+/** User overrides may omit top-level defaults; each supplied profile replaces the whole entry. */
+export function parseSupervisorConfig(value: unknown, defaults?: SupervisorConfig): SupervisorConfig {
 	const record = requireRecord(value, "config");
 	assertOnlyKeys(record, ["defaultProfile", "profiles"], "config");
-	const defaultProfile = requireName(record.defaultProfile, "config.defaultProfile");
-	const rawProfiles = requireRecord(record.profiles, "config.profiles");
-	const profiles = Object.create(null) as Record<string, LaunchProfile>;
+	const defaultProfile = requireName(record.defaultProfile === undefined ? defaults?.defaultProfile : record.defaultProfile, "config.defaultProfile");
+	const rawProfiles = requireRecord(record.profiles === undefined && defaults ? {} : record.profiles, "config.profiles");
+	const profiles = Object.assign(Object.create(null) as Record<string, LaunchProfile>, defaults?.profiles);
 	for (const [name, profile] of Object.entries(rawProfiles)) {
 		requireName(name, `config.profiles.${name}`);
 		profiles[name] = parseProfile(profile, `config.profiles.${name}`);
@@ -291,15 +267,6 @@ export function resolveLaunchRecipe(config: SupervisorConfig, input: StartRecipe
 		if (!input.model) throw new ProfileConfigurationError("model: select a model or inherit one from the parent session");
 		modelId = requireModelId(input.model, "model");
 		modelProfile = profile.models && Object.hasOwn(profile.models, modelId) ? profile.models[modelId] : undefined;
-	} else if (profile.models) {
-		modelId = input.model ?? profile.defaultModel;
-		if (input.model !== undefined && !Object.hasOwn(profile.models, input.model)) {
-			throw new ProfileConfigurationError(`model: profile ${JSON.stringify(profileName)} does not define model ID ${JSON.stringify(input.model)}`);
-		}
-		if (!modelId || !Object.hasOwn(profile.models, modelId)) {
-			throw new ProfileConfigurationError(`model: profile ${JSON.stringify(profileName)} has no usable default model ID`);
-		}
-		modelProfile = profile.models[modelId];
 	} else if (input.model !== undefined) {
 		throw new ProfileConfigurationError(`model: profile ${JSON.stringify(profileName)} does not support model selection`);
 	}

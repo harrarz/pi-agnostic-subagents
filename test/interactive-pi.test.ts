@@ -41,7 +41,7 @@ test("installed Pi RPC steers and resumes a real session against a loopback-only
 		executable: process.env.PI_BIN ?? "pi", args: ["--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--mode", "rpc", "--session", "{session}", "{modelArgs}"],
 		taskTransport: "pi-rpc", outputProtocol: "pi-jsonl", modelArgs: ["--model", "{model}"], environment: { PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_TELEMETRY: "0" },
 	} } });
-	const supervisor = new Supervisor(config, { paths: { configDirectory: root, profilesFile: join(root, "profiles.json"), runtimeDirectory: join(root, "runtime"), lockDirectory: join(root, "locks") }, parentCwd: root, sessionId: "real-rpc-loopback", stopGraceMs: 300 });
+	const supervisor = new Supervisor(config, { paths: { configDirectory: root, profilesFile: join(root, "profiles.json"), runtimeDirectory: join(root, "runtime") }, parentCwd: root, sessionId: "real-rpc-loopback", stopGraceMs: 300 });
 	await supervisor.initialize();
 	t.after(() => supervisor.shutdown());
 	const run = await supervisor.start({ task: "FIRST_CONTEXT_MARKER", model: "offline/test", timeoutMs: 15000 });

@@ -1,17 +1,16 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
-import { checkoutLockPath, CheckoutLockManager } from "../src/checkout-lock.js";
-import { getProcessStartIdentity, isProcessGroupAlive, processTokenEnvironment, terminateVerifiedProcessGroup } from "../src/process.js";
+import { isProcessGroupAlive } from "../src/process.js";
 import { parseSupervisorConfig, type SupervisorConfig } from "../src/profiles.js";
-import { RunStore } from "../src/run-store.js";
+import { RunStore, type StoredRun } from "../src/run-store.js";
 import { Supervisor, SupervisorError } from "../src/supervisor.js";
 import type { SupervisorPaths } from "../src/config.js";
 
@@ -31,20 +30,18 @@ function fakeConfig(transport: "argument" | "stdin" = "argument", executable = p
 	});
 }
 
-async function fixture(t: TestContext, options: { maxConcurrent?: number; maxQueued?: number; maxLogBytes?: number; outputTailBytes?: number; stopGraceMs?: number; onRunTerminal?: () => void } = {}) {
+async function fixture(t: TestContext, options: { maxLogBytes?: number; outputTailBytes?: number; stopGraceMs?: number; onRunTerminal?: () => void } = {}) {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-supervisor-e2e-"));
 	const sessionId = `test-session-${Math.random()}`;
 	const paths: SupervisorPaths = {
 		configDirectory: join(root, "config"),
 		profilesFile: join(root, "config", "profiles.json"),
 		runtimeDirectory: join(root, "runtime"),
-		lockDirectory: join(root, "locks"),
 	};
 	const supervisor = new Supervisor(fakeConfig(), {
 		paths,
 		sessionId,
-		parentCwd: process.cwd(),
-		queueRetryMs: 25,
+		parentCwd: root,
 		stopGraceMs: 100,
 		...options,
 	});
@@ -78,10 +75,6 @@ async function waitForFile(path: string, timeoutMs = 5000): Promise<boolean> {
 		}
 	}
 	return false;
-}
-
-function owner(runId: string, pid = process.pid, startIdentity = "dead-process") {
-	return { runId, supervisorToken: `supervisor-${runId}`, supervisorPid: pid, supervisorStartIdentity: startIdentity };
 }
 
 function jsonLineReader(child: ReturnType<typeof spawn>) {
@@ -124,36 +117,57 @@ async function waitForMessage(reader: ReturnType<typeof jsonLineReader>, predica
 	throw new Error("Timed out waiting for matching child supervisor message");
 }
 
-test("publishes terminal notification only after releasing the checkout writer lock", async (t) => {
-	let lockPath = "";
-	let lockPresentAtTerminal: boolean | undefined;
-	const { supervisor, paths } = await fixture(t, {
-		onRunTerminal: () => { lockPresentAtTerminal = existsSync(lockPath); },
-	});
-	lockPath = checkoutLockPath(paths, await realpath(process.cwd()));
-	const run = await supervisor.start({ task: "terminal cleanup ordering" });
-	const completed = await waitForState(supervisor, run.id, (state) => state === "exited");
-	assert.equal(completed.exitCode, 0);
-	assert.equal(lockPresentAtTerminal, false);
+test("shared writers run concurrently by default in a non-Git folder", async (t) => {
+	const { supervisor, root } = await fixture(t);
+	await writeFile(join(root, "tracked.txt"), "shared input");
+	const first = await supervisor.start({ task: JSON.stringify({ mode: "workspace", file: "first.txt", text: "one", ms: 60_000 }) });
+	const second = await supervisor.start({ task: JSON.stringify({ mode: "workspace", file: "second.txt", text: "two", ms: 60_000 }), isolation: "shared" });
+	await Promise.all([first, second].map((run) => waitForState(supervisor, run.id, (state) => state === "running")));
+	assert.equal(await waitForFile(join(root, "first.txt")), true);
+	assert.equal(await waitForFile(join(root, "second.txt")), true);
+	assert.equal(supervisor.inspect(first.id).cwd, supervisor.inspect(second.id).cwd);
+	assert.equal(supervisor.inspect(first.id).isolation, "shared");
+	assert.equal(await readFile(join(root, "first.txt"), "utf8"), "one");
+	assert.equal(await readFile(join(root, "second.txt"), "utf8"), "two");
+	await supervisor.stop(first.id);
+	assert.equal(supervisor.inspect(second.id).state, "running");
+	await supervisor.stop(second.id);
 });
 
 test("runs a real fake CLI through spawn, stdin/argv, bounded output, and durable exit status", async (t) => {
 	const { supervisor, paths } = await fixture(t, { maxLogBytes: 4096, outputTailBytes: 512 });
 	const task = "  echo 'quotes' 雪  ";
 	const started = await supervisor.start({ task });
-	assert.equal(started.state, "queued");
+	assert.equal(started.state, "starting");
 	const completed = await waitForState(supervisor, started.id, (state) => ["exited", "launch_failed", "interrupted"].includes(state));
 	assert.equal(completed.state, "exited");
 	assert.equal(completed.exitCode, 0);
 	assert.match(completed.outputTail, /OUT:  echo 'quotes' 雪  /);
 	assert.match(completed.outputTail, /ERR:  echo 'quotes' 雪  /);
 
+	// True/false can exit before macOS ps (or /proc) records a birth identity.
+	// Observe the actual child exit and retain the same descendant-cleanup gate.
+	const fastSupervisor = new Supervisor(parseSupervisorConfig({ defaultProfile: "fast-exit", profiles: {
+		"fast-exit": { executable: "true", args: ["{task}"], taskTransport: "argument" },
+		"fast-fail": { executable: "false", args: ["{task}"], taskTransport: "argument" },
+	} }), { paths, sessionId: "fast-argv-test-session", parentCwd: process.cwd(), stopGraceMs: 100 });
+	await fastSupervisor.initialize();
+	t.after(() => fastSupervisor.shutdown());
+	for (const profile of ["fast-exit", "fast-fail"]) {
+		for (let attempt = 0; attempt < 4; attempt++) {
+			const run = await fastSupervisor.start({ task: "fixture", profile });
+			const completed = await waitForState(fastSupervisor, run.id, (state) => ["exited", "interrupted", "launch_failed"].includes(state));
+			assert.equal(completed.state, "exited");
+			assert.equal(completed.exitCode, profile === "fast-exit" ? 0 : 1);
+			assert.equal(completed.error?.code, profile === "fast-exit" ? undefined : "PROCESS_EXIT");
+		}
+	}
+
 	const stdinConfig = fakeConfig("stdin");
 	const stdinSupervisor = new Supervisor(stdinConfig, {
 		paths,
 		sessionId: "stdin-test-session",
 		parentCwd: process.cwd(),
-		queueRetryMs: 25,
 		stopGraceMs: 100,
 	});
 	await stdinSupervisor.initialize();
@@ -173,7 +187,6 @@ test("allows a normal run to write into its checkout without a read-only sandbox
 		configDirectory: join(root, "config"),
 		profilesFile: join(root, "config", "profiles.json"),
 		runtimeDirectory: join(root, "runtime"),
-		lockDirectory: join(root, "locks"),
 	};
 	const supervisor = new Supervisor(fakeConfig(), { paths, sessionId: "writable-checkout", parentCwd: project });
 	await supervisor.initialize();
@@ -205,14 +218,15 @@ test("reports nonzero exits as process facts and rejects unavailable executables
 	await missing.shutdown();
 });
 
-test("enforces finite queue capacity, positive timeouts, and cwd checkout boundaries", async (t) => {
-	const { supervisor } = await fixture(t, { maxConcurrent: 1, maxQueued: 0 });
-	const running = await supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 500 }) });
-	await waitForState(supervisor, running.id, (state) => state === "running");
-	await assert.rejects(
-		supervisor.start({ task: "overflow" }),
-		(error: unknown) => error instanceof SupervisorError && error.code === "CAPACITY_FULL",
-	);
+test("launches more than ten agents without overrides while preserving timeout and cwd validation", async (t) => {
+	const { supervisor } = await fixture(t);
+	const task = JSON.stringify({ mode: "sleep", ms: 60_000 });
+	const runs = await Promise.all(Array.from({ length: 12 }, () => supervisor.start({ task })));
+	assert.ok(runs.every((run) => run.state === "starting"));
+	await Promise.all(runs.map((run) => waitForState(supervisor, run.id, (state) => state === "running")));
+	assert.equal(supervisor.snapshot().filter((run) => run.state === "running").length, 12);
+	assert.equal("maxConcurrent" in supervisor.limits, false);
+	assert.equal("maxQueued" in supervisor.limits, false);
 	await assert.rejects(
 		supervisor.start({ task: "zero timeout", timeoutMs: 0 }),
 		(error: unknown) => error instanceof SupervisorError && error.code === "INVALID_TIMEOUT",
@@ -221,20 +235,69 @@ test("enforces finite queue capacity, positive timeouts, and cwd checkout bounda
 		supervisor.start({ task: "outside cwd", cwd: tmpdir() }),
 		(error: unknown) => error instanceof SupervisorError && error.code === "CWD_OUTSIDE_CHECKOUT",
 	);
-	await supervisor.stop(running.id);
+	await Promise.all(runs.map((run) => supervisor.stop(run.id)));
 });
 
-test("transitions a queued run to cancelled without ever spawning it", async (t) => {
-	const { supervisor, root } = await fixture(t, { maxConcurrent: 1, maxQueued: 2 });
+test("can cancel a newly admitted starting run before process creation without a scheduler queue", async (t) => {
+	const { supervisor, root, paths, sessionId } = await fixture(t);
 	const marker = join(root, "must-not-exist");
-	const running = await supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 450 }) });
-	await waitForState(supervisor, running.id, (state) => state === "running");
-	const queued = await supervisor.start({ task: JSON.stringify({ mode: "mark", path: marker }) });
-	assert.equal((await supervisor.get(queued.id)).state, "queued");
-	const cancelled = await supervisor.stop(queued.id);
-	assert.equal(cancelled.state, "cancelled");
-	await waitForState(supervisor, running.id, (state) => state === "exited");
+	let stopping: ReturnType<Supervisor["stop"]> | undefined;
+	const unsubscribe = supervisor.subscribe(() => {
+		const run = supervisor.snapshot().find((run) => run.label === "cancel-before-spawn" && run.state === "starting");
+		if (run && !stopping) stopping = supervisor.stop(run.id);
+	});
+	t.after(unsubscribe);
+	const started = await supervisor.start({ task: JSON.stringify({ mode: "mark", path: marker }), label: "cancel-before-spawn" });
+	assert.ok(stopping);
+	assert.equal((await stopping).state, "cancelled");
+	assert.equal(supervisor.inspect(started.id).startedAt, undefined);
 	assert.equal(await waitForFile(marker, 150), false);
+	const stored = new RunStore(paths, sessionId); await stored.initialize();
+	assert.equal(stored.get(started.id)!.state, "cancelled");
+	assert.equal(stored.get(started.id)!.processPid, undefined);
+});
+
+test("shutdown waits for tracked launches to finish persisting terminal records", async (t) => {
+	const { supervisor } = await fixture(t);
+	const persist = RunStore.prototype.persist;
+	let release!: () => void;
+	const gate = new Promise<void>((done) => { release = done; });
+	t.mock.method(RunStore.prototype, "persist", async function (this: RunStore, record: StoredRun) {
+		if (record.state === "exited") await gate;
+		return persist.call(this, record);
+	});
+	try {
+		const run = await supervisor.start({ task: JSON.stringify({ mode: "exit", code: 0 }) });
+		const deadline = Date.now() + 8000;
+		while (supervisor.inspect(run.id).state !== "exited" && Date.now() < deadline) await new Promise((done) => setTimeout(done, 20));
+		assert.equal(supervisor.inspect(run.id).state, "exited");
+		let settled = false;
+		const shutdown = supervisor.shutdown().then(() => { settled = true; });
+		await new Promise((done) => setTimeout(done, 30));
+		assert.equal(settled, false);
+		release();
+		await shutdown;
+		assert.equal(settled, true);
+	} finally { release(); }
+});
+
+test("legacy queued records are interrupted on recovery, never scheduled or restarted", async (t) => {
+	const { root, paths, sessionId } = await fixture(t);
+	const store = new RunStore(paths, sessionId); await store.initialize();
+	const marker = join(root, "legacy-must-not-launch");
+	const record = store.create({ sessionId, supervisorToken: randomUUID(), processToken: randomUUID(),
+		profile: "fake", task: JSON.stringify({ mode: "mark", path: marker }), cwd: root,
+		state: "queued", queueReason: "Concurrency limit", createdAt: new Date().toISOString() });
+	await store.createLog(record); await store.persist(record);
+	const recovered = new Supervisor(fakeConfig(), { paths, sessionId, parentCwd: root });
+	t.after(() => recovered.shutdown());
+	await recovered.initialize();
+	const run = await recovered.get(record.id);
+	assert.equal(run.state, "interrupted");
+	assert.equal(run.error?.code, "OWNER_RESTARTED");
+	assert.equal(run.queueReason, undefined);
+	assert.equal(run.startedAt, undefined);
+	assert.equal(await waitForFile(marker, 100), false);
 });
 
 test("stops a running process tree and waits until cleanup is observed", async (t) => {
@@ -288,33 +351,28 @@ test("keeps disk logs and model-facing tails within separate configured bounds u
 	assert.equal((await store.tail(record, 512)).length <= 512, true);
 });
 
-test("serializes writers across supervisor instances sharing the global checkout lock", async (t) => {
-	const { supervisor: first, paths, root } = await fixture(t, { maxConcurrent: 1, maxQueued: 2 });
+test("shared writers overlap across supervisor instances in the same folder", async (t) => {
+	const { supervisor: first, paths, root } = await fixture(t);
 	const second = new Supervisor(fakeConfig(), {
 		paths,
 		sessionId: "separate-supervisor-session",
-		parentCwd: process.cwd(),
-		maxConcurrent: 1,
-		maxQueued: 2,
-		queueRetryMs: 25,
+		parentCwd: root,
 		stopGraceMs: 100,
 	});
 	await second.initialize();
 	t.after(() => second.shutdown());
 	const marker = join(root, "second-writer-started");
-	const firstRun = await first.start({ task: JSON.stringify({ mode: "sleep", ms: 350 }) });
+	const firstRun = await first.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000 }) });
 	await waitForState(first, firstRun.id, (state) => state === "running");
 	const secondRun = await second.start({ task: JSON.stringify({ mode: "mark", path: marker }) });
-	assert.equal((await second.get(secondRun.id)).state, "queued");
-	assert.equal(await waitForFile(marker, 120), false);
-	await waitForState(first, firstRun.id, (state) => state === "exited");
 	await waitForState(second, secondRun.id, (state) => state === "exited");
 	assert.equal(await waitForFile(marker), true);
+	assert.equal(first.inspect(firstRun.id).state, "running");
+	await first.stop(firstRun.id);
 });
 
 test("allows writers in separate checkouts to run concurrently", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-supervisor-separate-checkouts-"));
-	const lockDirectory = join(root, "global-locks");
 	const supervisors: Supervisor[] = [];
 	const started: Array<{ supervisor: Supervisor; id: string }> = [];
 	for (const [index, name] of ["first", "second"].entries()) {
@@ -325,9 +383,8 @@ test("allows writers in separate checkouts to run concurrently", async (t) => {
 			configDirectory: join(root, `config-${index}`),
 			profilesFile: join(root, `config-${index}`, "profiles.json"),
 			runtimeDirectory: join(root, `runtime-${index}`),
-			lockDirectory,
 		};
-		const supervisor = new Supervisor(fakeConfig(), { paths, sessionId: `separate-checkout-${index}`, parentCwd: project, maxConcurrent: 1, maxQueued: 1 });
+		const supervisor = new Supervisor(fakeConfig(), { paths, sessionId: `separate-checkout-${index}`, parentCwd: project });
 		await supervisor.initialize();
 		supervisors.push(supervisor);
 	}
@@ -340,16 +397,15 @@ test("allows writers in separate checkouts to run concurrently", async (t) => {
 	assert.deepEqual(states.map((run) => run.state), ["running", "running"]);
 });
 
-test("serializes writers launched by separate OS processes in one checkout", async () => {
+test("shared writers launched by separate OS processes overlap in one checkout", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-supervisor-cross-process-"));
 	const paths: SupervisorPaths = {
 		configDirectory: join(root, "config"),
 		profilesFile: join(root, "config", "profiles.json"),
 		runtimeDirectory: join(root, "runtime"),
-		lockDirectory: join(root, "locks"),
 	};
 	const driver = resolve(fixtureDir, "fixtures/writer-driver.mjs");
-	const first = spawn(process.execPath, ["--import", "tsx", driver, JSON.stringify(paths), process.cwd(), "os-writer-one", JSON.stringify({ mode: "sleep", ms: 500 })], {
+	const first = spawn(process.execPath, ["--import", "tsx", driver, JSON.stringify(paths), process.cwd(), "os-writer-one", JSON.stringify({ mode: "sleep", ms: 4000 })], {
 		stdio: ["ignore", "pipe", "inherit"], cwd: process.cwd(),
 	});
 	const firstReader = jsonLineReader(first);
@@ -363,11 +419,11 @@ test("serializes writers launched by separate OS processes in one checkout", asy
 		});
 		secondReader = jsonLineReader(second);
 		const admitted = await waitForMessage(secondReader, (message) => message.event === "admitted");
-		assert.equal(admitted.state, "queued");
-		assert.equal(await waitForFile(marker, 120), false);
-		await waitForMessage(firstReader, (message) => message.event === "state" && message.state === "exited");
+		assert.equal(admitted.state, "starting");
 		await waitForMessage(secondReader, (message) => message.event === "state" && message.state === "exited");
 		assert.equal(await waitForFile(marker), true);
+		assert.equal(first.exitCode, null, "the second writer must finish while the first is still running");
+		await waitForMessage(firstReader, (message) => message.event === "state" && message.state === "exited");
 	} finally {
 		firstReader.lines.close();
 		secondReader?.lines.close();
@@ -377,67 +433,12 @@ test("serializes writers launched by separate OS processes in one checkout", asy
 	}
 });
 
-test("reclaims stale PID locks but never steals a lock held by a live verified child", async (t) => {
-	const { paths } = await fixture(t);
-	const checkoutRoot = await realpath(process.cwd());
-	const manager = new CheckoutLockManager(paths, 0);
-	const stalePath = checkoutLockPath(paths, checkoutRoot);
-	await writeFile(stalePath, JSON.stringify({
-		...owner("dead-owner", 2_147_000_000, "old"),
-		version: 1,
-		checkoutRoot,
-		createdAt: new Date(0).toISOString(),
-		lockToken: "stale-token",
-	}));
-	const currentIdentity = await getProcessStartIdentity(process.pid);
-	assert.ok(currentIdentity);
-	const reclaimed = await manager.tryAcquire(checkoutRoot, owner("new-owner", process.pid, currentIdentity));
-	assert.ok(reclaimed);
-	await reclaimed.release();
-
-	await writeFile(stalePath, JSON.stringify({
-		...owner("reused-pid", process.pid, "different-process-start"),
-		version: 1,
-		checkoutRoot,
-		createdAt: new Date(0).toISOString(),
-		lockToken: "reused-pid-token",
-	}));
-	const afterPidReuse = await manager.tryAcquire(checkoutRoot, owner("after-pid-reuse", process.pid, currentIdentity));
-	assert.ok(afterPidReuse);
-	await afterPidReuse.release();
-
-	const token = `lock-child-${Date.now()}`;
-	const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-		stdio: "ignore",
-		detached: process.platform !== "win32",
-		env: { ...process.env, ...processTokenEnvironment(token) },
-	});
-	await once(child, "spawn");
-	const childPid = child.pid!;
-	const childIdentity = await getProcessStartIdentity(childPid);
-	assert.ok(childIdentity);
-	await writeFile(stalePath, JSON.stringify({
-		...owner("dead-owner", 2_147_000_000, "old"),
-		version: 1,
-		checkoutRoot,
-		createdAt: new Date(0).toISOString(),
-		lockToken: "stale-with-live-child",
-		childPid,
-		childStartIdentity: childIdentity,
-		childToken: token,
-	}));
-	assert.equal(await manager.tryAcquire(checkoutRoot, owner("must-wait")), undefined);
-	assert.equal(await terminateVerifiedProcessGroup(childPid, childIdentity, token, 100), true);
-	child.kill();
-});
-
 test("reconciles durable active runs after a supervisor crash without restarting them", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-supervisor-restart-"));
 	const paths: SupervisorPaths = {
 		configDirectory: join(root, "config"),
 		profilesFile: join(root, "config", "profiles.json"),
 		runtimeDirectory: join(root, "runtime"),
-		lockDirectory: join(root, "locks"),
 	};
 	const sessionId = "crash-reconciliation-session";
 	const driver = resolve(fixtureDir, "fixtures/restart-driver.mjs");
@@ -507,7 +508,6 @@ test("fails a spawn race as launch_failed rather than manufacturing an exit", as
 		paths,
 		sessionId: "spawn-failure-session",
 		parentCwd: process.cwd(),
-		queueRetryMs: 25,
 	});
 	await supervisor.initialize();
 	t.after(() => supervisor.shutdown());

@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { RpcTestClient } from "./fixtures/rpc-client.js";
 
 test("loads the extension in the installed Pi RPC runtime and runs slash commands without a model call", async () => {
-	const piBin = process.env.PI_BIN ?? "/opt/homebrew/bin/pi";
+	const piBin = process.env.PI_BIN ?? "pi";
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-supervisor-live-pi-"));
 	const agentDir = join(root, "pi-agent");
 	const project = join(root, "project");

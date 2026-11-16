@@ -10,11 +10,10 @@ import { test, type TestContext } from "node:test";
 import { Supervisor, type SupervisorOptions } from "../src/supervisor.js";
 import { parseSupervisorConfig } from "../src/profiles.js";
 import { isTerminalState, RunStore } from "../src/run-store.js";
-import { WorktreeManager } from "../src/worktrees.js";
+import { WorktreeManager, type WorktreeInfo } from "../src/worktrees.js";
 import { registerAgentTools } from "../src/tools.js";
 import type { PiExtensionApi } from "../src/pi-api.js";
-import { CheckoutLockManager } from "../src/checkout-lock.js";
-import { getProcessStartIdentity, isProcessGroupAlive } from "../src/process.js";
+import { isProcessGroupAlive } from "../src/process.js";
 
 function git(root: string, ...args: string[]): string {
 	return execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-C", root, ...args], { encoding: "utf8" }).trim();
@@ -33,13 +32,13 @@ async function fixture(t: TestContext, options: Partial<SupervisorOptions> = {})
 	await writeFile(join(project, "subdir/tracked.txt"), "committed subdirectory\n");
 	await writeFile(join(project, ".gitignore"), "ignored.txt\n");
 	commit(project, "seed");
-	const paths = { configDirectory: join(root, "config"), profilesFile: join(root, "config/profiles.json"), runtimeDirectory: join(root, "runtime"), lockDirectory: join(root, "locks") };
+	const paths = { configDirectory: join(root, "config"), profilesFile: join(root, "config/profiles.json"), runtimeDirectory: join(root, "runtime") };
 	const config = parseSupervisorConfig({ defaultProfile: "fake", profiles: { fake: {
 		executable: process.execPath, args: [resolve("test/fixtures/fake-agent.mjs"), "--", "{task}"], taskTransport: "argument", outputProtocol: "text",
 	} } });
 	const supervisors: Supervisor[] = [];
 	const make = async (overrides: Partial<SupervisorOptions> = {}) => {
-		const supervisor = new Supervisor(config, { paths, sessionId: randomUUID(), parentCwd: project, queueRetryMs: 20, stopGraceMs: 100, ...options, ...overrides });
+		const supervisor = new Supervisor(config, { paths, sessionId: randomUUID(), parentCwd: project, stopGraceMs: 100, ...options, ...overrides });
 		await supervisor.initialize();
 		supervisors.push(supervisor);
 		return supervisor;
@@ -60,6 +59,17 @@ async function complete(supervisor: Supervisor, id: string) {
 }
 
 const editTask = (text: string, ms = 3000) => JSON.stringify({ mode: "workspace", text, ms });
+
+function pausePreparation(t: TestContext): () => void {
+	const prepare = WorktreeManager.prototype.prepare;
+	let release!: () => void;
+	const gate = new Promise<void>((done) => { release = done; });
+	t.mock.method(WorktreeManager.prototype, "prepare", async function (this: WorktreeManager, info: WorktreeInfo, id: string) {
+		await gate;
+		return prepare.call(this, info, id);
+	});
+	return release;
+}
 
 test("two isolated writers overlap in one repository and never modify the dirty source", async (t) => {
 	const { supervisor, project } = await fixture(t);
@@ -103,31 +113,37 @@ test("isolated work can run alongside a shared writer and across supervisor inst
 });
 
 test("HEAD is pinned at admission and committed subdirectories map into the isolated checkout", async (t) => {
-	const { supervisor, project } = await fixture(t, { maxConcurrent: 1 });
-	const blocker = await supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000 }) });
-	await until(() => supervisor.inspect(blocker.id).state === "running");
-	const isolated = await supervisor.start({ task: editTask("subdir", 150), isolation: "worktree", cwd: join(project, "subdir") });
-	const plan = supervisor.inspect(isolated.id).worktree!;
-	await writeFile(join(project, "tracked.txt"), "later commit\n");
-	commit(project, "advance HEAD");
-	assert.notEqual(git(project, "rev-parse", "HEAD"), plan.baseCommit);
-	await supervisor.stop(blocker.id);
-	const result = await complete(supervisor, isolated.id);
-	assert.equal(result.state, "exited", result.error?.message ?? "expected normal exit");
-	assert.equal(result.cwd, join(plan.path, "subdir"));
-	assert.equal(git(plan.path, "rev-parse", "HEAD"), plan.baseCommit);
-	assert.equal(await readFile(join(plan.path, "tracked.txt"), "utf8"), "committed source\n");
-	assert.equal(await readFile(join(result.cwd, "work.txt"), "utf8"), "subdir");
+	const { supervisor, project } = await fixture(t);
+	const release = pausePreparation(t);
+	try {
+		const isolated = await supervisor.start({ task: editTask("subdir", 150), isolation: "worktree", cwd: join(project, "subdir") });
+		const plan = supervisor.inspect(isolated.id).worktree!;
+		await writeFile(join(project, "tracked.txt"), "later commit\n");
+		commit(project, "advance HEAD");
+		assert.notEqual(git(project, "rev-parse", "HEAD"), plan.baseCommit);
+		release();
+		const result = await complete(supervisor, isolated.id);
+		assert.equal(result.state, "exited", result.error?.message ?? "expected normal exit");
+		assert.equal(result.cwd, join(plan.path, "subdir"));
+		assert.equal(git(plan.path, "rev-parse", "HEAD"), plan.baseCommit);
+		assert.equal(await readFile(join(plan.path, "tracked.txt"), "utf8"), "committed source\n");
+		assert.equal(await readFile(join(result.cwd, "work.txt"), "utf8"), "subdir");
+	} finally { release(); }
 });
 
-test("queued cancellation creates neither a worktree nor a branch", async (t) => {
-	const { supervisor, project } = await fixture(t, { maxConcurrent: 1 });
-	const blocker = await supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000 }) });
-	await until(() => supervisor.inspect(blocker.id).state === "running");
-	const queued = await supervisor.start({ task: "never launched", isolation: "worktree" });
-	const plan = supervisor.inspect(queued.id).worktree!;
-	await supervisor.stop(queued.id);
-	assert.equal(supervisor.inspect(queued.id).worktree!.state, "not_created");
+test("starting cancellation before preparation creates neither a worktree nor a branch", async (t) => {
+	const { supervisor, project } = await fixture(t);
+	let stopping: ReturnType<Supervisor["stop"]> | undefined;
+	const unsubscribe = supervisor.subscribe(() => {
+		const run = supervisor.snapshot().find((run) => run.label === "cancel-before-preparation" && run.state === "starting");
+		if (run && !stopping) stopping = supervisor.stop(run.id);
+	});
+	t.after(unsubscribe);
+	const run = await supervisor.start({ task: "never launched", label: "cancel-before-preparation", isolation: "worktree" });
+	const plan = supervisor.inspect(run.id).worktree!;
+	assert.ok(stopping);
+	assert.equal((await stopping).state, "cancelled");
+	assert.equal(supervisor.inspect(run.id).worktree!.state, "not_created");
 	await assert.rejects(stat(plan.path), { code: "ENOENT" });
 	assert.throws(() => git(project, "show-ref", "--verify", "--quiet", `refs/heads/${plan.branch}`));
 });
@@ -159,21 +175,22 @@ test("worktree creation disables checkout hooks and retains clean completed work
 });
 
 test("setup failure is explicit and never runs a child in the source checkout", async (t) => {
-	const { supervisor, project } = await fixture(t, { maxConcurrent: 1 });
-	const blocker = await supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000 }) });
-	await until(() => supervisor.inspect(blocker.id).state === "running");
-	const isolated = await supervisor.start({ task: editTask("must not write", 0), isolation: "worktree" });
-	const branch = supervisor.inspect(isolated.id).worktree!.branch;
-	git(project, "branch", branch);
-	await supervisor.stop(blocker.id);
-	const result = await complete(supervisor, isolated.id);
-	assert.equal(result.state, "launch_failed");
-	assert.equal(result.error?.code, "WORKTREE_CREATE");
-	assert.equal(result.worktree!.state, "failed");
-	await assert.rejects(supervisor.removeWorktree(isolated.id), /uncertain/);
-	assert.equal(result.startedAt, undefined);
-	await assert.rejects(readFile(join(project, "work.txt")), { code: "ENOENT" });
-	assert.equal(git(project, "branch", "--show-current"), "main");
+	const { supervisor, project } = await fixture(t);
+	const release = pausePreparation(t);
+	try {
+		const isolated = await supervisor.start({ task: editTask("must not write", 0), isolation: "worktree" });
+		const branch = supervisor.inspect(isolated.id).worktree!.branch;
+		git(project, "branch", branch);
+		release();
+		const result = await complete(supervisor, isolated.id);
+		assert.equal(result.state, "launch_failed");
+		assert.equal(result.error?.code, "WORKTREE_CREATE");
+		assert.equal(result.worktree!.state, "failed");
+		await assert.rejects(supervisor.removeWorktree(isolated.id), /uncertain/);
+		assert.equal(result.startedAt, undefined);
+		await assert.rejects(readFile(join(project, "work.txt")), { code: "ENOENT" });
+		assert.equal(git(project, "branch", "--show-current"), "main");
+	} finally { release(); }
 });
 
 test("cancellation during Git preparation waits for setup and preserves the worktree without launching", async (t) => {
@@ -238,17 +255,13 @@ test("cleanup refuses live runs and dirty/ignored work; clean removal keeps bran
 	assert.equal((await supervisor.removeWorktree(live.id)).worktree!.state, "removed");
 });
 
-test("cleanup refuses renamed branches, substituted paths and foreign locks", async (t) => {
-	const { supervisor, project, root, paths } = await fixture(t);
+test("cleanup refuses renamed branches and substituted paths", async (t) => {
+	const { supervisor, project, root } = await fixture(t);
 	const run = await supervisor.start({ task: "clean", isolation: "worktree" });
 	const result = await complete(supervisor, run.id);
 	git(result.cwd, "checkout", "-qb", "human-branch");
 	await assert.rejects(supervisor.removeWorktree(run.id), /registration or branch changed/);
 	git(result.cwd, "checkout", "-q", result.worktree!.branch);
-	const lock = await new CheckoutLockManager(paths).tryAcquire(result.worktree!.path, { runId: "foreign", supervisorToken: "foreign", supervisorPid: process.pid, supervisorStartIdentity: (await getProcessStartIdentity(process.pid))! });
-	assert.ok(lock);
-	await assert.rejects(supervisor.removeWorktree(run.id), /locked by another/);
-	await lock.release();
 	git(project, "worktree", "remove", result.cwd);
 	const victim = join(root, "foreign-directory"); await mkdir(victim); await writeFile(join(victim, "keep.txt"), "keep");
 	await symlink(victim, result.cwd);
@@ -290,15 +303,16 @@ test("crash recovery stops the verified child but preserves branch, workspace an
 	}
 });
 
-test("worktree runs remain capacity bounded even with no queue slots", async (t) => {
-	const { supervisor } = await fixture(t, { maxConcurrent: 2, maxQueued: 0 });
+test("more than ten worktree runs launch concurrently with default options and no queue", async (t) => {
+	const { supervisor } = await fixture(t);
 	const task = JSON.stringify({ mode: "sleep", ms: 60_000 });
-	const first = await supervisor.start({ task, isolation: "worktree" });
-	await until(() => supervisor.inspect(first.id).state === "running");
-	const second = await supervisor.start({ task, isolation: "worktree" });
-	await until(() => supervisor.inspect(second.id).state === "running");
-	await assert.rejects(supervisor.start({ task, isolation: "worktree" }), /capacity/);
-	assert.equal(supervisor.snapshot().length, 2);
+	const runs = await Promise.all(Array.from({ length: 12 }, () => supervisor.start({ task, isolation: "worktree" })));
+	assert.ok(runs.every((run) => run.state === "starting"));
+	await until(() => runs.every((run) => supervisor.inspect(run.id).state === "running"));
+	assert.equal(new Set(runs.map((run) => supervisor.inspect(run.id).cwd)).size, 12);
+	assert.equal(supervisor.snapshot().filter((run) => run.state === "queued").length, 0);
+	await supervisor.shutdown();
+	for (const run of runs) assert.equal(supervisor.inspect(run.id).state, "cancelled");
 });
 
 test("model tools expose workspace identity and never expose destructive cleanup", async (t) => {

@@ -50,7 +50,7 @@ export class ModelSettings {
 	async resolve(ctx: PiContext, config: SupervisorConfig, input: StartInput): Promise<StartInput> {
 		const name = input.profile ?? config.defaultProfile;
 		const profile = Object.hasOwn(config.profiles, name) ? config.profiles[name] : undefined;
-		if (!profile || (!profile.models && !profile.modelArgs)) return input;
+		if (!profile?.modelArgs) return input;
 		const chosen = input.model ?? (await this.load()).models[name];
 		let model = chosen;
 		if (model === undefined) {
@@ -59,8 +59,7 @@ export class ModelSettings {
 			model = modelName(profile, ctx.model.provider, ctx.model.id);
 		}
 		if (!validModel(model)) throw new Error("Invalid model selection");
-		if (!profile.modelArgs && profile.models && !Object.hasOwn(profile.models, model)) throw new Error(`Profile ${name} does not define model ID ${JSON.stringify(model)}.`);
-		if (profile.modelArgs && (profile.modelFormat ?? "qualified") === "qualified") {
+		if ((profile.modelFormat ?? "qualified") === "qualified") {
 			const available = availableModels(ctx, profile);
 			if (!available.includes(model)) throw new Error(`Model ${JSON.stringify(model)} is not available in this Pi session's model scope. Choose another model; no fallback was applied.`);
 		}
@@ -89,7 +88,7 @@ export async function openModelSettings(ctx: PiContext, config: SupervisorConfig
 	}
 	for (;;) {
 		const preferences = await settings.load();
-		const profiles = Object.entries(config.profiles).filter(([, profile]) => profile.modelArgs || profile.models);
+		const profiles = Object.entries(config.profiles).filter(([, profile]) => profile.modelArgs);
 		if (!profiles.length) { ctx.ui.notify("No profiles expose model selection.", "info"); return; }
 		const labels = profiles.map(([name, profile]) => {
 			const inherited = ctx.model ? modelName(profile, ctx.model.provider, ctx.model.id) : "none selected";

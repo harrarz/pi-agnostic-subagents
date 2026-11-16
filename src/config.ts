@@ -1,13 +1,13 @@
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { BUNDLED_PROFILE_CONFIG } from "./default-profiles.js";
 import { parseSupervisorConfig, type SupervisorConfig } from "./profiles.js";
 
 export interface SupervisorPaths {
 	configDirectory: string;
 	profilesFile: string;
 	runtimeDirectory: string;
-	lockDirectory: string;
 }
 
 /**
@@ -18,12 +18,10 @@ export function getSupervisorPaths(env: NodeJS.ProcessEnv = process.env, home = 
 	const piConfigRoot = env.PI_CODING_AGENT_DIR?.trim();
 	const piRoot = piConfigRoot ? resolve(piConfigRoot) : join(home, ".pi", "agent");
 	const configDirectory = join(piRoot, "agent-supervisor");
-	const lockDirectory = join(home, ".pi", "agent", "agent-supervisor", "locks");
 	return {
 		configDirectory,
 		profilesFile: join(configDirectory, "profiles.json"),
 		runtimeDirectory: join(configDirectory, "runtime"),
-		lockDirectory,
 	};
 }
 
@@ -32,8 +30,15 @@ export async function ensurePrivateSupervisorDirectories(paths = getSupervisorPa
 	await chmod(paths.configDirectory, 0o700);
 	await mkdir(paths.runtimeDirectory, { recursive: true, mode: 0o700 });
 	await chmod(paths.runtimeDirectory, 0o700);
-	await mkdir(paths.lockDirectory, { recursive: true, mode: 0o700 });
-	await chmod(paths.lockDirectory, 0o700);
+}
+
+export function loadBundledSupervisorConfig(): SupervisorConfig {
+	try {
+		return parseSupervisorConfig(BUNDLED_PROFILE_CONFIG);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		throw new Error(`Invalid bundled supervisor profiles: ${detail}`, { cause: error });
+	}
 }
 
 export async function loadSupervisorConfig(filePath = getSupervisorPaths().profilesFile): Promise<SupervisorConfig> {
@@ -41,6 +46,7 @@ export async function loadSupervisorConfig(filePath = getSupervisorPaths().profi
 	try {
 		source = await readFile(filePath, "utf8");
 	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return loadBundledSupervisorConfig();
 		const detail = error instanceof Error ? error.message : String(error);
 		throw new Error(`Unable to read trusted supervisor profiles at ${filePath}: ${detail}`, { cause: error });
 	}
@@ -53,7 +59,7 @@ export async function loadSupervisorConfig(filePath = getSupervisorPaths().profi
 	}
 
 	try {
-		return parseSupervisorConfig(parsed);
+		return parseSupervisorConfig(parsed, loadBundledSupervisorConfig());
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		throw new Error(`Invalid trusted supervisor profiles at ${filePath}: ${detail}`, { cause: error });

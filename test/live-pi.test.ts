@@ -22,7 +22,7 @@ test("LIVE Pi parent delegates once, real child reads/writes, and parent retriev
 		await mkdir(project);
 		execFileSync("git", ["init", "-q", project]);
 		await writeFile(join(project, "seed.txt"), "17\n");
-		const child = spawn(process.env.PI_BIN ?? "/opt/homebrew/bin/pi", [
+		const child = spawn(process.env.PI_BIN ?? "pi", [
 			"--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--extension", resolve("src/index.ts"),
 			"--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
 			"--model", model, ...(thinking ? ["--thinking", thinking] : []), "--no-tools", "--tools", "agent_start,agent_get",

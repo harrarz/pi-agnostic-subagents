@@ -22,7 +22,7 @@ test("LIVE Pi stop cleans up a real bash tool's descendants; timeout cleans up a
 		const effortFlag = effort ? ` --effort ${effort}` : "";
 		await mkdir(project);
 		execFileSync("git", ["init", "-q", project]);
-		client = new RpcTestClient(spawn(process.env.PI_BIN ?? "/opt/homebrew/bin/pi", [
+		client = new RpcTestClient(spawn(process.env.PI_BIN ?? "pi", [
 			"--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--extension", resolve("src/index.ts"),
 			"--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-tools",
 			"--model", model, ...(thinking ? ["--thinking", thinking] : []),

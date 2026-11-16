@@ -141,6 +141,7 @@ function detailText(run: RunView): string {
 		`Profile: ${run.profile}${run.model ? ` · Model: ${run.model}` : ""}${run.effort ? ` · Effort: ${run.effortAlias ?? run.effort}` : ""}`,
 		`Elapsed: ${elapsed(run)}${run.startedAt ? ` · Started: ${run.startedAt}` : ""}${run.endedAt ? ` · Ended: ${run.endedAt}` : ""}`,
 		`Working directory: ${run.cwd}`,
+		`Isolation: ${run.isolation === "worktree" ? "separate worktree" : "shared · concurrent writes; no conflict prevention"}`,
 		`Task: ${oneLine(run.task, 700)}`,
 	];
 	if (run.worktree) lines.push(`Worktree: ${run.worktree.path} (${run.worktree.state})`, `Branch: ${run.worktree.branch}`, `Source: ${run.worktree.sourceCwd} · Base: ${run.worktree.baseCommit}`, run.worktree.note);
@@ -173,7 +174,7 @@ async function openPicker(ctx: PiCommandContext, supervisor: Supervisor): Promis
 
 export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCommandDependencies): void {
 	pi.registerCommand("agent", {
-		description: "Start and inspect explicitly requested headless-agent runs",
+		description: "Start and inspect concurrent shared-folder agents or isolated worktree runs",
 		getArgumentCompletions: (prefix) => {
 			const choices = SUBCOMMANDS.filter((subcommand) => subcommand.startsWith(prefix));
 			return choices.length ? choices.map((value) => ({ value, label: value })) : null;
@@ -200,7 +201,7 @@ export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCom
 						const input = { task: parsed.task, ...parsed.options };
 						const started = await supervisor.start(dependencies.resolveStart ? await dependencies.resolveStart(ctx, input) : input);
 						const run = supervisor.inspect(started.id);
-						notify(ctx, `Started agent run ${started.id} (${started.state}). Process exit is not a task-quality judgment.${run.worktree ? `\nWorktree: ${run.worktree.path}\nBranch: ${run.worktree.branch}\n${run.worktree.note}` : ""}`);
+						notify(ctx, `Started agent run ${started.id} (${started.state}). Process exit is not a task-quality judgment.${run.worktree ? `\nWorktree: ${run.worktree.path}\nBranch: ${run.worktree.branch}\n${run.worktree.note}` : "\nShared folder: concurrent writes allowed; overlapping edits can overwrite each other."}`);
 						return;
 					}
 					case "list":
@@ -245,7 +246,7 @@ export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCom
 								const defaultEffort = model.defaultEffort ?? profile.defaultEffort;
 								return `${modelId} [efforts: ${effortAliases}${defaultEffort ? `; default ${defaultEffort}` : ""}]`;
 							}).join("; ") || "model override unsupported";
-							return `${name}${name === config.defaultProfile ? " (default profile)" : ""}: ${profile.executable}; ${profile.modelArgs || profile.models ? "model: user selection / parent session; " : ""}${modelInfo}`;
+							return `${name}${name === config.defaultProfile ? " (default profile)" : ""}: ${profile.executable}; ${profile.modelArgs ? "model: user selection / parent session; " : ""}${modelInfo}`;
 						});
 						notify(ctx, lines.join("\n"));
 						return;
