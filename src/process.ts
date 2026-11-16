@@ -7,12 +7,6 @@ import { delimiter, isAbsolute, relative, resolve, sep } from "node:path";
 const execFileAsync = promisify(execFile);
 const PROCESS_TOKEN_ENV = "PI_AGENT_SUPERVISOR_PROCESS_TOKEN";
 
-function debugInspection(reason: string, details: Record<string, string | number | boolean | undefined> = {}): void {
-	if (process.env.PI_AGENT_SUPERVISOR_DEBUG_PROCESS === "1") {
-		// Static categories/counters only; never include commands, tokens or environments.
-		console.error(`[agent-supervisor process] ${reason} ${JSON.stringify(details)}`);
-	}
-}
 
 export class ProcessPreflightError extends Error {
 	constructor(readonly code: string, message: string) {
@@ -220,10 +214,8 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 			const entries = (await readdir("/proc")).filter((name) => /^\d+$/.test(name));
 			for (let offset = 0; offset < entries.length; offset += 32) {
 				await Promise.all(entries.slice(offset, offset + 32).map(async (name) => {
-					let phase = "uid";
 					try {
 						if ((await stat(`/proc/${name}`)).uid !== process.getuid!()) return;
-						phase = "birth";
 						const snapshot = await linuxProcessSnapshot(Number(name));
 						if (!snapshot) {
 							if (!isPidAlive(Number(name))) return;
@@ -234,7 +226,6 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 						if (terminatedLinuxState(snapshot.state)) return;
 						// Older tasks cannot have inherited this run's new token.
 						if (earliestTicks !== undefined && snapshot.startTicks < earliestTicks) return;
-						phase = "environment";
 						const env = await readFile(`/proc/${name}/environ`);
 						if (env.toString("utf8").split("\0").includes(marker)) pids.add(Number(name));
 					} catch (error) {
@@ -242,20 +233,7 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 						// terminated state or vanished PID, never an unreadable live task.
 						const latest = await linuxProcessSnapshot(Number(name));
 						if (terminatedLinuxState(latest?.state) || (!latest && !isPidAlive(Number(name)))) return;
-						if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) {
-							let state: string | undefined;
-							let parentIsSelf: boolean | undefined;
-							if (process.env.PI_AGENT_SUPERVISOR_DEBUG_PROCESS === "1") {
-								try {
-									const line = await readFile(`/proc/${name}/stat`, "utf8");
-									const fields = line.slice(line.lastIndexOf(")") + 1).trim().split(/\s+/);
-									state = /^[A-Z]$/.test(fields[0]) ? fields[0] : "unknown";
-									parentIsSelf = fields[1] === String(process.pid);
-								} catch { /* No raw error text or process contents. */ }
-							}
-							debugInspection("proc-access-unavailable", { code: (error as NodeJS.ErrnoException).code ?? "identity", phase, self: Number(name) === process.pid, parentIsSelf, state });
-							throw new Error("Process inspection unavailable");
-						}
+						if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw new Error("Process inspection unavailable");
 					}
 				}));
 			}
@@ -277,8 +255,8 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 			if (startIdentity) {
 				const inherited = await processHasToken(pid, token);
 				if (inherited === true) owned.push({ pid, startIdentity });
-				else if (inherited === undefined && isPidAlive(pid)) { debugInspection("token-snapshot-unavailable"); return undefined; }
-			} else if (isPidAlive(pid)) { debugInspection("birth-snapshot-unavailable"); return undefined; }
+				else if (inherited === undefined && isPidAlive(pid)) return undefined;
+			} else if (isPidAlive(pid)) return undefined;
 		}
 		return owned;
 	} catch { return undefined; }
@@ -335,15 +313,11 @@ export async function terminateOwnedProcessTree(
 		await new Promise((resolveWait) => setTimeout(resolveWait, 30));
 		remaining = await findOwnedProcesses(token, inspectionFloor);
 	}
-	let unverifiedAlive = 0;
 	for (const [unverifiedPid, identity] of unverified) {
 		if (process.platform === "linux" && terminatedLinuxState((await linuxProcessSnapshot(unverifiedPid))?.state)) continue;
-		if (isPidAlive(unverifiedPid) && await getProcessStartIdentity(unverifiedPid) === identity) { inspectionFailed = true; unverifiedAlive++; }
+		if (isPidAlive(unverifiedPid) && await getProcessStartIdentity(unverifiedPid) === identity) inspectionFailed = true;
 	}
-	const groupStillAlive = Boolean(pid && isProcessGroupAlive(pid));
-	const verified = groupGone && !groupStillAlive && !inspectionFailed && remaining !== undefined && remaining.length === 0;
-	if (!verified) debugInspection("cleanup-unverified", { groupGone, groupStillAlive, inspectionFailed, unverifiedAlive, scanAvailable: remaining !== undefined, remainingOwners: remaining?.length });
-	return verified;
+	return groupGone && (!pid || !isProcessGroupAlive(pid)) && !inspectionFailed && remaining !== undefined && remaining.length === 0;
 }
 
 export interface SpawnOptions {
