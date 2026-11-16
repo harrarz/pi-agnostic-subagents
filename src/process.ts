@@ -255,7 +255,14 @@ export async function terminateOwnedProcessTree(
 	let emptyScans = 0;
 	while (Date.now() < deadline) {
 		const owned = await findOwnedProcesses(token);
-		if (!owned) { inspectionFailed = true; break; }
+		if (!owned) {
+			// A process can disappear between ps/proc snapshots during cleanup.
+			// Do not signal from an unavailable inspection, but retry within the
+			// existing deadline. Persistent uncertainty still fails the final scan.
+			emptyScans = 0;
+			await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+			continue;
+		}
 		if (owned.length === 0) {
 			if (++emptyScans >= 2) break;
 		} else {

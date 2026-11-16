@@ -301,7 +301,7 @@ test("legacy queued records are interrupted on recovery, never scheduled or rest
 });
 
 test("stops a running process tree and waits until cleanup is observed", async (t) => {
-	const { supervisor, paths, sessionId } = await fixture(t, { maxConcurrent: 1, maxQueued: 1, stopGraceMs: 80 });
+	const { supervisor, paths, sessionId, root } = await fixture(t, { stopGraceMs: 80 });
 	const run = await supervisor.start({ task: JSON.stringify({ mode: "spawn-child", ms: 60_000, ignoreTerm: true }) });
 	await waitForState(supervisor, run.id, (state) => state === "running");
 	let running = await supervisor.get(run.id);
@@ -313,9 +313,41 @@ test("stops a running process tree and waits until cleanup is observed", async (
 	const store = new RunStore(paths, sessionId);
 	const processMetadata = JSON.parse(await readFile(join(store.directory, `${run.id}.json`), "utf8"));
 	assert.ok(running.outputTail.includes("DESCENDANT:"));
-	const stopped = await supervisor.stop(run.id);
-	assert.equal(stopped.state, "cancelled");
-	assert.equal(isProcessGroupAlive(processMetadata.processPid), false);
+	const originalPath = process.env.PATH;
+	const shimDirectory = join(root, "ps-shim");
+	const marker = join(root, "inspection-gap-observed");
+	let realPs = "";
+	const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+	if (process.platform === "darwin") {
+		realPs = execFileSync("which", ["ps"], { encoding: "utf8" }).trim();
+		await mkdir(shimDirectory);
+		await writeFile(join(shimDirectory, "ps"), `#!/bin/sh\nif [ "$1" = eww ] && [ "$2" = -U ] && [ ! -e ${quote(marker)} ]; then : > ${quote(marker)}; exit 1; fi\nexec ${quote(realPs)} "$@"\n`, { mode: 0o700 });
+		process.env.PATH = `${shimDirectory}:${originalPath ?? ""}`;
+	}
+	try {
+		const stopped = await supervisor.stop(run.id);
+		assert.equal(stopped.state, "cancelled", JSON.stringify(stopped.error));
+		assert.equal(isProcessGroupAlive(processMetadata.processPid), false);
+		if (process.platform === "darwin") assert.equal(await waitForFile(marker, 100), true);
+	} finally {
+		if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
+	}
+	if (process.platform === "darwin") {
+		// A persistent inspection failure must remain interrupted, not clean.
+		const uncertain = await supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000, ignoreTerm: true }) });
+		await waitForState(supervisor, uncertain.id, (state) => state === "running");
+		const metadata = JSON.parse(await readFile(join(store.directory, `${uncertain.id}.json`), "utf8"));
+		await writeFile(join(shimDirectory, "ps"), `#!/bin/sh\nif [ "$1" = eww ] && [ "$2" = -U ]; then exit 1; fi\nexec ${quote(realPs)} "$@"\n`, { mode: 0o700 });
+		process.env.PATH = `${shimDirectory}:${originalPath ?? ""}`;
+		try {
+			const stopped = await supervisor.stop(uncertain.id);
+			assert.equal(stopped.state, "interrupted");
+			assert.equal(stopped.error?.code, "CLEANUP_UNVERIFIED");
+			assert.equal(isProcessGroupAlive(metadata.processPid), false);
+		} finally {
+			if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
+		}
+	}
 });
 
 test("cleans up descendants when the direct CLI exits normally", async (t) => {
