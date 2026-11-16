@@ -371,6 +371,37 @@ test("stops a running process tree and waits until cleanup is observed", async (
 			assert.equal(await terminateOwnedProcessTree(younger.pid, identity, token, 100, true), true);
 			assert.equal(older.exitCode, null);
 			assert.equal(older.signalCode, null);
+
+			// A real zombie's environ may be unreadable. It is terminated, not
+			// an unverified live owner; the original process group must still go.
+			const parent = spawn("python3", [resolve(fixtureDir, "fixtures/zombie-parent.py")], { ...options, stdio: ["ignore", "pipe", "ignore"] });
+			const parentClosed = once(parent, "close");
+			const lines = createInterface({ input: parent.stdout! });
+			const zombieLine = once(lines, "line");
+			try {
+				const [line] = await zombieLine;
+				const zombiePid = Number(line);
+				assert.ok(Number.isSafeInteger(zombiePid) && zombiePid > 0);
+				let state = "";
+				const deadline = Date.now() + 2000;
+				while (state !== "Z" && Date.now() < deadline) {
+					const stat = await readFile(`/proc/${zombiePid}/stat`, "utf8");
+					state = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)[0];
+					if (state !== "Z") await new Promise((done) => setTimeout(done, 10));
+				}
+				assert.equal(state, "Z");
+				const parentIdentity = await getProcessStartIdentity(parent.pid!);
+				assert.ok(parentIdentity);
+				const liveOwners = await findOwnedProcesses(token, parentIdentity);
+				assert.ok(liveOwners);
+				assert.ok(liveOwners.some((entry) => entry.pid === parent.pid));
+				assert.equal(liveOwners.some((entry) => entry.pid === zombiePid), false);
+				assert.equal(await terminateOwnedProcessTree(parent.pid, parentIdentity, token, 100, true), true);
+			} finally {
+				lines.close();
+				if (parent.exitCode === null && parent.signalCode === null) parent.kill("SIGKILL");
+				await parentClosed;
+			}
 		} finally {
 			older.kill("SIGKILL");
 			if (younger?.exitCode === null && younger.signalCode === null) younger.kill("SIGKILL");

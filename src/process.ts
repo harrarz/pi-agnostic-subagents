@@ -87,20 +87,22 @@ export async function canonicalizeCwd(requestedCwd: string | undefined, parentCw
 	return { cwd, checkoutRoot };
 }
 
+async function linuxProcessSnapshot(pid: number): Promise<{ state: string; identity: string; startTicks: bigint } | undefined> {
+	try {
+		const line = await readFile(`/proc/${pid}/stat`, "utf8");
+		const closeParen = line.lastIndexOf(")");
+		if (closeParen < 0) return undefined;
+		const fields = line.slice(closeParen + 1).trim().split(/\s+/);
+		if (!/^[A-Z]$/.test(fields[0]) || !/^[0-9]{1,30}$/.test(fields[19])) return undefined;
+		return { state: fields[0], identity: `linux:${fields[19]}`, startTicks: BigInt(fields[19]) };
+	} catch { return undefined; }
+}
+
+function terminatedLinuxState(state: string | undefined): boolean { return state === "Z" || state === "X"; }
+
 export async function getProcessStartIdentity(pid: number): Promise<string | undefined> {
 	if (!Number.isInteger(pid) || pid <= 0) return undefined;
-	if (process.platform === "linux") {
-		try {
-			const statLine = await readFile(`/proc/${pid}/stat`, "utf8");
-			const closeParen = statLine.lastIndexOf(")");
-			if (closeParen < 0) return undefined;
-			const fieldsAfterComm = statLine.slice(closeParen + 1).trim().split(/\s+/);
-			const startTicks = fieldsAfterComm[19];
-			return startTicks ? `linux:${startTicks}` : undefined;
-		} catch {
-			return undefined;
-		}
-	}
+	if (process.platform === "linux") return (await linuxProcessSnapshot(pid))?.identity;
 	try {
 		const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="], {
 			encoding: "utf8",
@@ -221,22 +223,25 @@ export async function findOwnedProcesses(token: string, earliestIdentity?: strin
 					let phase = "uid";
 					try {
 						if ((await stat(`/proc/${name}`)).uid !== process.getuid!()) return;
-						if (earliestTicks !== undefined) {
-							phase = "birth";
-							const born = linuxStartTicks(await getProcessStartIdentity(Number(name)));
-							if (born === undefined) {
-								if (!isPidAlive(Number(name))) return;
-								throw new Error("Process identity unavailable");
-							}
-							// An older process cannot have inherited this run's new token.
-							// In particular, unrelated protected CI/service processes must
-							// not make every later run's ownership scan unverifiable.
-							if (born < earliestTicks) return;
+						phase = "birth";
+						const snapshot = await linuxProcessSnapshot(Number(name));
+						if (!snapshot) {
+							if (!isPidAlive(Number(name))) return;
+							throw new Error("Process identity unavailable");
 						}
+						// Zombies/dead tasks cannot execute, fork, or retain workspace
+						// files. Their environ may deny access while awaiting reaping.
+						if (terminatedLinuxState(snapshot.state)) return;
+						// Older tasks cannot have inherited this run's new token.
+						if (earliestTicks !== undefined && snapshot.startTicks < earliestTicks) return;
 						phase = "environment";
 						const env = await readFile(`/proc/${name}/environ`);
 						if (env.toString("utf8").split("\0").includes(marker)) pids.add(Number(name));
 					} catch (error) {
+						// Exit can race the earlier state read. Ignore only an observed
+						// terminated state or vanished PID, never an unreadable live task.
+						const latest = await linuxProcessSnapshot(Number(name));
+						if (terminatedLinuxState(latest?.state) || (!latest && !isPidAlive(Number(name)))) return;
 						if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) {
 							let state: string | undefined;
 							let parentIsSelf: boolean | undefined;
@@ -325,9 +330,14 @@ export async function terminateOwnedProcessTree(
 		await new Promise((resolveWait) => setTimeout(resolveWait, 30));
 	}
 	const groupGone = await groupCleanup;
-	const remaining = await findOwnedProcesses(token, inspectionFloor);
+	let remaining = await findOwnedProcesses(token, inspectionFloor);
+	while (remaining === undefined && Date.now() < deadline) {
+		await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+		remaining = await findOwnedProcesses(token, inspectionFloor);
+	}
 	let unverifiedAlive = 0;
 	for (const [unverifiedPid, identity] of unverified) {
+		if (process.platform === "linux" && terminatedLinuxState((await linuxProcessSnapshot(unverifiedPid))?.state)) continue;
 		if (isPidAlive(unverifiedPid) && await getProcessStartIdentity(unverifiedPid) === identity) { inspectionFailed = true; unverifiedAlive++; }
 	}
 	const groupStillAlive = Boolean(pid && isProcessGroupAlive(pid));
