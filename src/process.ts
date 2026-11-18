@@ -48,7 +48,7 @@ async function gitRoot(cwd: string): Promise<string | undefined> {
 			timeout: 3000,
 			maxBuffer: 64 * 1024,
 		});
-		return await realpath(stdout.trim());
+		return await realpath(stdout.replace(/\n$/, ""));
 	} catch {
 		return undefined;
 	}
@@ -64,21 +64,18 @@ export async function canonicalizeCwd(requestedCwd: string | undefined, parentCw
 	let cwd: string;
 	try {
 		parent = await realpath(parentCwd);
-		cwd = await realpath(requestedCwd ?? parentCwd);
-	} catch (error) {
-		throw new ProcessPreflightError("INVALID_CWD", `Working directory does not exist or is inaccessible: ${requestedCwd ?? parentCwd}`);
+		cwd = requestedCwd === undefined ? parent : await realpath(resolve(parent, requestedCwd));
+		if (!(await stat(cwd)).isDirectory()) throw new Error("Not a directory");
+	} catch {
+		throw new ProcessPreflightError("INVALID_CWD", `Working directory does not exist, is not a directory, or is inaccessible: ${requestedCwd ?? parentCwd}`);
 	}
-	const [parentGitRoot, targetGitRoot] = await Promise.all([gitRoot(parent), gitRoot(cwd)]);
-	const parentRoot = parentGitRoot ?? parent;
-	const checkoutRoot = targetGitRoot ?? cwd;
-	if (parentGitRoot || targetGitRoot) {
-		if (!parentGitRoot || !targetGitRoot || parentGitRoot !== targetGitRoot) {
-			throw new ProcessPreflightError("CWD_OUTSIDE_CHECKOUT", "Requested cwd must be inside the Pi session's Git checkout");
-		}
-	} else if (!isWithin(parentRoot, cwd)) {
-		throw new ProcessPreflightError("CWD_OUTSIDE_CHECKOUT", "Requested cwd must be inside the Pi session working directory");
+	const targetGitRoot = await gitRoot(cwd);
+	// Nested repositories are fine. Preserve sibling access within the session's
+	// own Git checkout, but don't let plain --cwd follow a symlink elsewhere.
+	if (!isWithin(parent, cwd) && (!targetGitRoot || targetGitRoot !== await gitRoot(parent))) {
+		throw new ProcessPreflightError("CWD_OUTSIDE_CHECKOUT", "Requested cwd must be inside the Pi session directory or its Git checkout");
 	}
-	return { cwd, checkoutRoot };
+	return { cwd, checkoutRoot: targetGitRoot ?? cwd };
 }
 
 async function linuxProcessSnapshot(pid: number): Promise<{ state: string; identity: string; startTicks: bigint } | undefined> {

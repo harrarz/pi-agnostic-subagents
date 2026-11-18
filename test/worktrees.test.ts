@@ -148,6 +148,32 @@ test("starting cancellation before preparation creates neither a worktree nor a 
 	assert.throws(() => git(project, "show-ref", "--verify", "--quiet", `refs/heads/${plan.branch}`));
 });
 
+test("nested cwd uses the nested checkout without allowing paths or symlinks to escape", async (t) => {
+	const { supervisor, project, root, make } = await fixture(t);
+	const nested = join(project, "nested-repo");
+	git(project, "init", "-q", "-b", "main", nested);
+	await writeFile(join(nested, "tracked.txt"), "nested repo source\n");
+	commit(nested, "nested seed");
+
+	const plain = await make({ parentCwd: root });
+	const shared = await plain.start({ task: "nested shared", cwd: "source/nested-repo" });
+	assert.equal((await complete(plain, shared.id)).cwd, nested);
+
+	const isolated = await supervisor.start({ task: "nested isolated", cwd: "nested-repo", isolation: "worktree" });
+	const result = await complete(supervisor, isolated.id);
+	assert.equal(result.state, "exited", result.error?.message ?? "expected normal exit");
+	assert.equal(result.worktree!.sourceRoot, nested);
+	assert.equal(result.worktree!.baseCommit, git(nested, "rev-parse", "HEAD"));
+
+	const external = join(root, "external-repo");
+	git(root, "init", "-q", "-b", "main", external);
+	await symlink(external, join(project, "escape"));
+	for (const cwd of [external, "escape", "../external-repo"]) {
+		await assert.rejects(supervisor.start({ task: "no", cwd }), { code: "CWD_OUTSIDE_CHECKOUT" });
+	}
+	await assert.rejects(supervisor.start({ task: "no", cwd: "tracked.txt" }), { code: "INVALID_CWD" });
+});
+
 test("non-Git/unborn/uncommitted cwd and invalid isolation fail before admission", async (t) => {
 	const { supervisor, project, root, make } = await fixture(t);
 	await mkdir(join(project, "untracked-dir"));
