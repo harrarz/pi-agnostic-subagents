@@ -70,8 +70,20 @@ Follow-ups and unchanged reruns keep the resolved selection. Missing selected fi
 
 ## Workspaces and history
 
-Shared runs write concurrently; no checkout locks or conflict prevention. `--isolation worktree` creates a separate checkout at committed HEAD, excluding dirty/untracked source files. **Worktrees and branches stay retained.** `/agent worktree remove <id>` requires confirmation, verified process cleanup, and a clean tree; it never forces deletion or removes the branch.
+Shared runs write concurrently; no checkout locks or conflict prevention. `--isolation worktree` creates a separate checkout at committed HEAD, excluding dirty/untracked source files. Use `--cwd path` to choose a directory in the session's checkout or under its working directory; nested Git repos use their own HEAD for isolation.
 
-`/agent` inspects runs and offers human-directed steering/follow-up for RPC profiles. Model tools remain `agent_start`, `agent_get`, and `agent_stop`; `agent_get` supports `answer`, `transcript`, and `raw` views. Per-run options include `--label`, `--profile`, `--model`, `--effort`, `--cwd`, `--isolation`, and `--timeout-ms`.
+### One agent, multiple repos
+
+```text
+/agent run --label contract-fix --profile pi --repo ../web=main --repo '/path/to/my api=release/v2' -- Update the API and its consumer together. Do not commit.
+```
+
+Repeat `--repo path=ref` (or pass `repos: [{path, ref}, …]` to `agent_start`). Use existing Git checkout roots, with paths absolute or relative to the Pi session directory. Checkouts may be anywhere Git can access on that machine. No repo list, cloning, or fetching is required. Quote `path=ref` as one argument if it contains spaces. For a ref containing `=`, use its commit ID or the structured `repos` input. Don't combine a bundle with `--cwd` or shared isolation.
+
+Each ref is pinned to a commit before any worktree is created. The worker starts only once all members are ready, in the parent directory of the new checkouts. Use a profile that supports starting outside Git (such as Pi). For Codex, opt in via a trusted profile with `--skip-git-repo-check` in its `exec` args; leave sandbox settings intact. Folders use repo names where possible, with distinct names if they collide. Two runs get separate sets of checkouts; use the same exact commit IDs to guarantee matching bases. Failed or cancelled setup leaves any created members for inspection and does not launch the worker.
+
+`/agent show <id>` and `agent_get` report each checkout, branch, and pinned commit. Review, commit, and merge per repo. Follow-up reuses the original bundle; a fresh rerun resolves the same refs again. Worktrees and branches stay retained. `/agent worktree remove <id>` requires confirmation and verified process cleanup; it checks that all checkouts are clean before removing any, never forces deletion, and keeps the branches and any files in the bundle directory outside the checkouts.
+
+`/agent` inspects runs and offers human-directed steering/follow-up for RPC profiles. Model tools remain `agent_start`, `agent_get`, and `agent_stop`; `agent_get` supports `answer`, `transcript`, and `raw` views.
 
 Private records/logs/sessions live under `agent-supervisor/runtime/`. Diagnostic logs are bounded; saved conversations are not. Remove history only while idle. Worktrees and extension modes are not security sandboxes, and exit code 0 does not establish task correctness.

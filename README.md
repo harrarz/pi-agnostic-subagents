@@ -3,7 +3,7 @@
 Launch and control whichever Pi subagent fits your task—no forced roles or workflows.
 
 - **Agent-agnostic:** bundled Pi, Codex, and Claude Code profiles; add another CLI through trusted user JSON.
-- **Explicit delegation:** assign custom tasks to general-purpose agents, with concurrent execution and writes in shared folders or worktrees—no automatic fanout or nested delegation.
+- **Explicit delegation:** run tasks concurrently in shared folders, single worktrees, or multi-repo worktree bundles—no automatic fanout or nested delegation.
 - **Observability:** `/agent` browser and status widget, clean answers, transcripts, diagnostics, and confirmed stop/rerun.
 - **Live controls:** human- or agent-directed steering and saved-session follow-up for RPC-capable profiles.
 - **Owned lifecycle:** timeouts, descendant cleanup, crash recovery, private records, and bounded diagnostic logs.
@@ -22,6 +22,7 @@ pi install npm:@harrarz/pi-agnostic-subagents
 ```text
 /agent run --profile pi -- Fix token refresh and run the relevant tests
 /agent run --profile codex --isolation worktree -- Update setup documentation
+/agent run --profile pi --repo ../web=main --repo ../api=release/v2 -- Update the API and its consumer together
 /agent
 ```
 
@@ -29,7 +30,7 @@ Use the browser to inspect, steer, stop, follow up, or rerun. `/agent settings` 
 
 ## Know the boundaries
 
-- Shared runs without separate worktrees can overwrite each other's edits. Worktrees start at **committed HEAD**, do not copy dirty files, and are not security sandboxes.
+- Shared runs can overwrite each other's edits. Single worktrees start at committed HEAD; bundles pin a branch or commit per repo. Neither copies dirty files or provides a security sandbox.
 - No automatic commits, merges, dependency installation, spending limits, or default timeout. There is no agent-count cap or scheduler queue.
 - Worktrees, records, and saved conversations remain until explicitly cleaned up.
 
