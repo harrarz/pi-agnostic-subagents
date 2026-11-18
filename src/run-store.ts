@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { SupervisorPaths } from "./config.js";
 import type { OutputProtocol, RunPresentation } from "./presentation.js";
-import type { Isolation, WorktreeInfo } from "./worktrees.js";
+import type { BundleWorktree, Isolation, RunWorktrees, WorktreeBundleInfo, WorktreeInfo } from "./worktrees.js";
 import type { ResolvedExtensions } from "./profiles.js";
 
 export type RunState =
@@ -17,12 +17,11 @@ export type RunState =
 	| "timed_out"
 	| "interrupted";
 
-export interface StoredRun {
+export interface StoredRun extends RunWorktrees {
 	extensions?: ResolvedExtensions;
 	control?: { protocol: "pi-rpc"; sessionPath: string; conversationId: string; turn: number; continuedFrom?: string };
 	worktreeOwnerId?: string;
 	isolation?: Isolation;
-	worktree?: WorktreeInfo;
 	label?: string;
 	outputProtocol?: OutputProtocol;
 	presentation?: RunPresentation;
@@ -103,6 +102,7 @@ function isStoredRun(value: unknown): value is StoredRun {
 			&& (run.extensions.mode !== "none" || run.extensions.paths.length === 0)
 			&& (run.extensions.mode !== "custom" || run.extensions.paths.length > 0)))
 		&& (run.worktree === undefined || isWorktreeInfo(run.worktree))
+		&& (run.worktreeBundle === undefined || (run.worktree === undefined && run.isolation === "worktree" && isWorktreeBundle(run.worktreeBundle)))
 		&& (run.worktreeOwnerId === undefined || /^[0-9a-f-]{36}$/.test(run.worktreeOwnerId))
 		&& (run.control === undefined || (run.control?.protocol === "pi-rpc"
 			&& typeof run.control.sessionPath === "string" && typeof run.control.conversationId === "string"
@@ -115,6 +115,13 @@ function isWorktreeInfo(value: unknown): value is WorktreeInfo {
 	const info = value as WorktreeInfo;
 	return ["path", "branch", "baseCommit", "sourceRoot", "sourceCwd", "commonDir", "relativeCwd", "note"].every((key) => typeof info[key as keyof WorktreeInfo] === "string")
 		&& ["pending", "ready", "retained", "not_created", "failed", "removed"].includes(info.state);
+}
+
+function isWorktreeBundle(value: unknown): value is WorktreeBundleInfo {
+	if (!value || typeof value !== "object") return false;
+	const bundle = value as Partial<WorktreeBundleInfo>;
+	return typeof bundle.path === "string" && Array.isArray(bundle.members) && bundle.members.length > 0
+		&& bundle.members.every((member: BundleWorktree) => isWorktreeInfo(member) && typeof member.name === "string" && typeof member.ref === "string");
 }
 
 export class RunStore {

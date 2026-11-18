@@ -28,7 +28,8 @@ function processMessage(notice: RunTerminalNotice): string {
 }
 
 function terminalMessage(notice: RunTerminalNotice): string {
-	const workspace = notice.worktree ? `\nWorktree: ${notice.worktree.path} (${notice.worktree.state})\nBranch: ${notice.worktree.branch}. No automatic commit or merge.` : "";
+	const workspace = notice.worktreeBundle ? `\nWorktree bundle: ${notice.worktreeBundle.path}. Use /agent show ${notice.id} for checkout states.`
+		: notice.worktree ? `\nWorktree: ${notice.worktree.path} (${notice.worktree.state})\nBranch: ${notice.worktree.branch}. No automatic commit or merge.` : "";
 	return safeText(processMessage(notice) + workspace);
 }
 

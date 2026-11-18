@@ -15,7 +15,7 @@ export function browserActions(run: RunSummary): BrowserAction[] {
 	if (["queued", "starting", "running"].includes(run.state)) actions.push("stop");
 	if (run.capabilities?.followUp) actions.push("followUp");
 	if (isTerminalState(run.state)) actions.push("rerun", "editRerun");
-	if (run.worktree) actions.push("workspace");
+	if (run.worktree || run.worktreeBundle) actions.push("workspace");
 	return actions;
 }
 export function actionLabel(action: BrowserAction, run: RunSummary): string {
@@ -25,17 +25,20 @@ export function actionLabel(action: BrowserAction, run: RunSummary): string {
 async function editRerun(ctx: PiCommandContext, run: RunSummary, picker?: ExtensionPicker): Promise<Partial<StartInput> | undefined> {
 	const draft: Partial<StartInput> = { task: run.task, model: run.model, effort: run.effortAlias, timeoutMs: run.timeoutMs, isolation: run.isolation ?? "shared", extensions: run.extensions?.mode, extensionSet: run.extensions?.set };
 	for (;;) {
-		const choices = ["Run", `Task: ${oneLine(draft.task!, 70)}`, `Model: ${draft.model ?? "CLI configuration"}`, `Effort: ${draft.effort ?? "CLI configuration"}`, `Timeout (ms): ${draft.timeoutMs ?? "none"}`, `Isolation: ${draft.isolation === "shared" ? "shared (concurrent writes)" : "worktree"}`, ...(picker && run.extensions ? [`Extensions: ${extensionLabel({ mode: draft.extensions!, set: draft.extensionSet })}`] : []), "Cancel"];
-		const choice = await ctx.ui.select("Rerun with changes · fresh conversation/workspace", choices.map(safeText));
+		const choices = ["Run", `Task: ${oneLine(draft.task!, 70)}`, `Model: ${draft.model ?? "CLI configuration"}`, `Effort: ${draft.effort ?? "CLI configuration"}`, `Timeout (ms): ${draft.timeoutMs ?? "none"}`];
+		const isolationIndex = run.worktreeBundle ? -1 : choices.push(`Isolation: ${draft.isolation === "shared" ? "shared (concurrent writes)" : "worktree"}`) - 1;
+		const extensionIndex = picker && run.extensions ? choices.push(`Extensions: ${extensionLabel({ mode: draft.extensions!, set: draft.extensionSet })}`) - 1 : -1;
+		choices.push("Cancel");
+		const choice = await ctx.ui.select(run.worktreeBundle ? "Rerun with changes · fresh worktree bundle" : "Rerun with changes · fresh conversation/workspace", choices.map(safeText));
 		if (!choice || choice === "Cancel") return;
 		const index = choices.map(safeText).indexOf(choice);
 		if (index === 0) return draft;
-		if (index === 6 && picker && run.extensions) {
+		if (index === extensionIndex && picker && run.extensions) {
 			const selection = await picker(run.profile, { mode: draft.extensions!, set: draft.extensionSet });
 			if (selection) { draft.extensions = selection.mode; draft.extensionSet = selection.set; }
 			continue;
 		}
-		if (index === 5) {
+		if (index >= 0 && index === isolationIndex) {
 			const isolation = await ctx.ui.select("Checkout isolation", ["shared (concurrent writes)", "worktree"]);
 			if (isolation === "shared (concurrent writes)") draft.isolation = "shared";
 			else if (isolation === "worktree") draft.isolation = "worktree";
@@ -71,7 +74,10 @@ export async function executeBrowserRequest(ctx: PiCommandContext, supervisor: S
 	if (request.action === "rerun" || request.action === "editRerun") {
 		const changes = request.action === "editRerun" ? await editRerun(ctx, run, picker) : {};
 		if (!changes) return;
-		if (!await ctx.ui.confirm("Start fresh agent run?", safeText(`Same resolved settings unless edited. No conversation or previous worktree changes are copied.${(changes.isolation ?? run.isolation) === "worktree" ? " New worktree starts from current committed HEAD; previous worktree is retained." : " Uses the current shared folder with concurrent writes; overlapping edits can overwrite each other."}`))) return;
+		const workspace = run.worktreeBundle ? " Makes a new bundle using the same repo paths and refs, resolved again. Previous checkouts are retained."
+			: (changes.isolation ?? run.isolation) === "worktree" ? " New worktree starts from current committed HEAD; previous worktree is retained."
+				: " Uses the current shared folder with concurrent writes; overlapping edits can overwrite each other.";
+		if (!await ctx.ui.confirm("Start fresh agent run?", safeText(`Same resolved settings unless edited. No conversation or previous worktree changes are copied.${workspace}`))) return;
 		return (await supervisor.rerun(run.id, changes)).id;
 	}
 }

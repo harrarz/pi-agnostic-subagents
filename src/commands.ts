@@ -4,7 +4,8 @@ import type { ExtensionSelection, SupervisorConfig } from "./profiles.js";
 import { extensionLabel, type ExtensionPicker } from "./worker-extensions.js";
 import type { RunView } from "./run-store.js";
 import { openAgentBrowser } from "./ui.js";
-import { safeText } from "./display.js";
+import { bundleLines, safeText } from "./display.js";
+import type { WorktreeRepoInput } from "./worktrees.js";
 
 export interface AgentCommandDependencies {
 	getSupervisor(ctx: PiContext): Promise<Supervisor>;
@@ -21,7 +22,7 @@ export interface ParsedRunCommand {
 }
 
 const SUBCOMMANDS = ["run", "list", "show", "stop", "profiles", "settings", "config", "extensions", "worktree"] as const;
-const COMMAND_USAGE = "Usage: /agent [run [--label name] [--profile name] [--model model-id] [--effort alias] [--extensions none|inherit|custom] [--extension-set name] [--cwd path] [--isolation shared|worktree] [--timeout-ms n] -- <task> | list | show <id> | stop <id> | profiles | settings | extensions | worktree remove <id>]";
+const COMMAND_USAGE = "Usage: /agent [run [--label name] [--profile name] [--model model-id] [--effort alias] [--extensions none|inherit|custom] [--extension-set name] [--cwd path | --repo path=ref ...] [--isolation shared|worktree] [--timeout-ms n] -- <task> | list | show <id> | stop <id> | profiles | settings | extensions | worktree remove <id>]";
 
 function skipWhitespace(input: string, index: number): number {
 	while (index < input.length && /\s/.test(input[index])) index++;
@@ -54,6 +55,7 @@ export function parseRunCommandArgs(rawArgs: string): ParsedRunCommand {
 	const input = rawArgs;
 	let cursor = skipWhitespace(input, 0);
 	const options: ParsedRunCommand["options"] = {};
+	const repos: WorktreeRepoInput[] = [];
 	const seen = new Set<string>();
 	const optionMap = new Map<string, keyof ParsedRunCommand["options"]>([
 		["--label", "label"],
@@ -63,6 +65,7 @@ export function parseRunCommandArgs(rawArgs: string): ParsedRunCommand {
 		["--extensions", "extensions"],
 		["--extension-set", "extensionSet"],
 		["--cwd", "cwd"],
+		["--repo", "repos"],
 		["--isolation", "isolation"],
 		["--timeout-ms", "timeoutMs"],
 	]);
@@ -81,7 +84,7 @@ export function parseRunCommandArgs(rawArgs: string): ParsedRunCommand {
 		const flag = equals >= 0 ? token.value.slice(0, equals) : token.value;
 		const option = optionMap.get(flag);
 		if (!option) throw new Error(`Unknown run option ${JSON.stringify(flag)}`);
-		if (seen.has(flag)) throw new Error(`Run option ${flag} may only be used once`);
+		if (option !== "repos" && seen.has(flag)) throw new Error(`Run option ${flag} may only be used once`);
 		seen.add(flag);
 		let value: string;
 		if (equals >= 0) {
@@ -95,7 +98,12 @@ export function parseRunCommandArgs(rawArgs: string): ParsedRunCommand {
 			cursor = valueToken.next;
 		}
 		if (!value) throw new Error(`Run option ${flag} requires a nonempty value`);
-		if (option === "timeoutMs") {
+		if (option === "repos") {
+			const separator = value.lastIndexOf("=");
+			if (separator <= 0 || separator === value.length - 1) throw new Error("--repo requires path=ref (repeat for each repository)");
+			repos.push({ path: value.slice(0, separator), ref: value.slice(separator + 1) });
+			options.repos = repos;
+		} else if (option === "timeoutMs") {
 			const timeoutMs = Number(value);
 			if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("--timeout-ms must be a positive integer");
 			options.timeoutMs = timeoutMs;
@@ -135,7 +143,7 @@ function elapsed(run: RunView, now = Date.now()): string {
 
 function runLabel(run: RunView, maxTaskChars: number): string {
 	const model = run.model ? ` ${run.model}${run.effortAlias ? `/${run.effortAlias}` : ""}` : "";
-	return `${run.id}  ${run.state}  ${run.profile}${model}  ${elapsed(run)}  ${oneLine(run.label ?? run.task, maxTaskChars)}${run.isolation === "worktree" ? " · worktree" : ""}${run.queueReason ? ` · ${run.queueReason}` : ""}`;
+	return `${run.id}  ${run.state}  ${run.profile}${model}  ${elapsed(run)}  ${oneLine(run.label ?? run.task, maxTaskChars)}${run.worktreeBundle ? ` · ${run.worktreeBundle.members.length} worktrees` : run.isolation === "worktree" ? " · worktree" : ""}${run.queueReason ? ` · ${run.queueReason}` : ""}`;
 }
 
 function listText(runs: RunView[]): string {
@@ -149,11 +157,12 @@ function detailText(run: RunView): string {
 		`Profile: ${run.profile}${run.model ? ` · Model: ${run.model}` : ""}${run.effort ? ` · Effort: ${run.effortAlias ?? run.effort}` : ""}`,
 		`Elapsed: ${elapsed(run)}${run.startedAt ? ` · Started: ${run.startedAt}` : ""}${run.endedAt ? ` · Ended: ${run.endedAt}` : ""}`,
 		`Working directory: ${run.cwd}`,
-		`Isolation: ${run.isolation === "worktree" ? "separate worktree" : "shared · concurrent writes; no conflict prevention"}`,
+		`Isolation: ${run.worktreeBundle ? "worktree bundle" : run.isolation === "worktree" ? "separate worktree" : "shared · concurrent writes; no conflict prevention"}`,
 		`Task: ${oneLine(run.task, 700)}`,
 	];
 	if (run.extensions) lines.push(`Extensions: ${extensionLabel(run.extensions)} · ${run.extensions.paths.length} selected`);
 	if (run.worktree) lines.push(`Worktree: ${run.worktree.path} (${run.worktree.state})`, `Branch: ${run.worktree.branch}`, `Source: ${run.worktree.sourceCwd} · Base: ${run.worktree.baseCommit}`, run.worktree.note);
+	if (run.worktreeBundle) lines.push(...bundleLines(run.worktreeBundle));
 	if (run.exitCode !== undefined) lines.push(`Exit code: ${run.exitCode}`);
 	if (run.signal) lines.push(`Signal: ${run.signal}`);
 	if (run.error) lines.push(`Process note: ${run.error.message}`);
@@ -211,7 +220,10 @@ export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCom
 						const input = { task: parsed.task, ...parsed.options };
 						const started = await supervisor.start(dependencies.resolveStart ? await dependencies.resolveStart(ctx, input) : input);
 						const run = supervisor.inspect(started.id);
-						notify(ctx, `Started agent run ${started.id} (${started.state}). Process exit is not a task-quality judgment.${run.worktree ? `\nWorktree: ${run.worktree.path}\nBranch: ${run.worktree.branch}\n${run.worktree.note}` : "\nShared folder: concurrent writes allowed; overlapping edits can overwrite each other."}`);
+						const workspace = run.worktreeBundle ? `Worktree bundle: ${run.worktreeBundle.path}\n${run.worktreeBundle.members.length} checkouts; use /agent show ${run.id} for paths and bases.`
+							: run.worktree ? `Worktree: ${run.worktree.path}\nBranch: ${run.worktree.branch}\n${run.worktree.note}`
+								: "Shared folder: concurrent writes allowed; overlapping edits can overwrite each other.";
+						notify(ctx, `Started agent run ${started.id} (${started.state}). Process exit is not a task-quality judgment.\n${workspace}`);
 						return;
 					}
 					case "list":
@@ -238,10 +250,13 @@ export function registerAgentCommands(pi: PiExtensionApi, dependencies: AgentCom
 						if (parts.length !== 2 || parts[0] !== "remove") throw new Error("Usage: /agent worktree remove <run-id>");
 						if (!ctx.hasUI) throw new Error("Worktree removal requires human UI confirmation; use Git manually outside TUI/RPC mode.");
 						const run = supervisor.inspect(parts[1]);
-						if (!run.worktree) throw new Error("This run has no isolated worktree");
-						if (!await ctx.ui.confirm("Remove clean agent worktree?", safeText(`${run.worktree.path}\nBranch ${run.worktree.branch} will be kept. Dirty/ignored files and active runs are refused; no force deletion.`))) return;
+						if (!run.worktree && !run.worktreeBundle) throw new Error("This run has no isolated worktree");
+						const target = run.worktreeBundle
+							? `${run.worktreeBundle.path}\nAll ${run.worktreeBundle.members.length} checkouts will be checked before removal. Branches and files outside the checkouts will be kept.`
+							: `${run.worktree!.path}\nBranch ${run.worktree!.branch} will be kept.`;
+						if (!await ctx.ui.confirm(run.worktreeBundle ? "Remove clean agent worktree bundle?" : "Remove clean agent worktree?", safeText(`${target}\nDirty/ignored files and active runs are refused; no force deletion.`))) return;
 						const removed = await supervisor.removeWorktree(run.id);
-						notify(ctx, removed.worktree!.note);
+						notify(ctx, removed.worktreeBundle ? "Clean bundle checkouts removed. All branches were kept." : removed.worktree!.note);
 						return;
 					}
 					case "extensions":

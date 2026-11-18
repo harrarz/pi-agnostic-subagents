@@ -2,7 +2,7 @@ import { RpcTransport } from "./rpc-transport.js";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { OutputPresenter } from "./presentation.js";
-import { WorktreeError, WorktreeManager, type Isolation, type WorktreeInfo } from "./worktrees.js";
+import { WorktreeError, WorktreeManager, worktreeMembers, worktreeRoot, type Isolation, type RunWorktrees, type WorktreeBundleInfo, type WorktreeRepoInput } from "./worktrees.js";
 import { spawn as spawnChild } from "node:child_process";
 import { chmod, lstat, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -33,11 +33,11 @@ export interface StartInput extends StartRecipeInput {
 	isolation?: Isolation;
 	label?: string;
 	cwd?: string;
+	repos?: readonly WorktreeRepoInput[];
 	timeoutMs?: number;
 }
 
-export interface RunTerminalNotice {
-	worktree?: WorktreeInfo;
+export interface RunTerminalNotice extends RunWorktrees {
 	label?: string;
 	finalAnswer?: string;
 	protocolWarning?: string;
@@ -162,9 +162,10 @@ export class Supervisor {
 			const cleanupVerified = await terminateOwnedProcessTree(
 				record.processPid, record.processStartIdentity, record.processToken, this.limits.stopGraceMs,
 			);
-			if (record.worktree) {
-				record.worktree.state = record.worktree.state === "ready" ? "retained" : "failed";
-				record.worktree.note += " Owner was lost; any workspace and branch are preserved for manual inspection.";
+			for (const worktree of worktreeMembers(record)) {
+				if (worktree.state === "ready") worktree.state = "retained";
+				else if (worktree.state === "pending") worktree.state = "failed";
+				worktree.note += " Owner was lost; any workspace and branch are preserved for manual inspection.";
 			}
 			record.state = "interrupted";
 			delete record.queueReason;
@@ -217,8 +218,10 @@ export class Supervisor {
 	async rerun(id: string, changes: Partial<StartInput> = {}): Promise<StartResult> {
 		const run = await this.get(id);
 		if (!isTerminalState(run.state)) throw new SupervisorError("RUN_ACTIVE", "Only terminal runs can be rerun");
+		const repos = run.worktreeBundle?.members.map(({ sourceRoot, ref }) => ({ path: sourceRoot, ref }));
 		const input: StartInput = { task: run.task, label: run.label, profile: run.profile, model: run.model, effort: run.effortAlias,
-			cwd: run.worktree?.sourceCwd ?? run.cwd, isolation: run.isolation, timeoutMs: run.timeoutMs,
+			cwd: repos || changes.repos ? undefined : run.worktree?.sourceCwd ?? run.cwd,
+			repos, isolation: changes.repos ? "worktree" : run.isolation, timeoutMs: run.timeoutMs,
 			extensions: run.extensions?.mode, extensionSet: run.extensions?.set, ...changes };
 		if (input.extensions !== "custom") delete input.extensionSet;
 		const sameSelection = input.extensions === run.extensions?.mode && input.extensionSet === run.extensions?.set && input.profile === run.profile;
@@ -238,7 +241,7 @@ export class Supervisor {
 		const run = this.latestConversation(this.store.get(id)!);
 		if (!this.capabilities(run).followUp) throw new SupervisorError("FOLLOW_UP_UNAVAILABLE", "No safely settled, saved conversation is available for follow-up");
 		return this.admit({ task: message, label: run.label, profile: run.profile, model: run.model, effort: run.effortAlias,
-			cwd: run.worktree?.sourceCwd ?? run.cwd, isolation: run.isolation, timeoutMs: run.timeoutMs }, run);
+			cwd: run.worktreeBundle ? undefined : run.worktree?.sourceCwd ?? run.cwd, isolation: run.isolation, timeoutMs: run.timeoutMs }, run);
 	}
 
 	private validateMessage(message: string): void {
@@ -258,7 +261,7 @@ export class Supervisor {
 			followUp: !this.closed && this.store.recoveryWarnings.length === 0 && Boolean(run.control && latest.state === "exited" && latest.exitCode === 0 && !latest.error
 				&& latest.presentation?.finalAnswer && existsSync(latest.control!.sessionPath)
 				&& this.config.profiles[latest.profile]?.taskTransport === "pi-rpc"
-				&& (!latest.worktree || latest.worktree.state === "retained")),
+				&& worktreeMembers(latest).every((member) => member.state === "retained")),
 		};
 	}
 
@@ -267,7 +270,10 @@ export class Supervisor {
 		const recordId = randomUUID();
 		const sessionPath = continuation?.control?.sessionPath ?? join(this.options.paths.runtimeDirectory, "sessions", `${recordId}.jsonl`);
 		if (input.isolation !== undefined && input.isolation !== "shared" && input.isolation !== "worktree") throw new SupervisorError("INVALID_ISOLATION", "isolation must be shared or worktree");
-		const isolation = input.isolation ?? "shared";
+		if (input.repos !== undefined && (input.cwd !== undefined || input.isolation === "shared")) {
+			throw new SupervisorError("INVALID_REPOS", "A worktree bundle starts in its own parent directory; do not combine repos with cwd or shared isolation");
+		}
+		const isolation = input.repos !== undefined ? "worktree" : input.isolation ?? "shared";
 		if (input.label !== undefined && (typeof input.label !== "string" || !input.label.trim() || input.label.length > 80 || /[\x00-\x1f\x7f-\x9f]/.test(input.label))) {
 			throw new SupervisorError("INVALID_LABEL", "label must be 1–80 characters without control characters");
 		}
@@ -302,6 +308,15 @@ export class Supervisor {
 			throw new SupervisorError("TASK_TOO_LARGE", "Argument/RPC-transport tasks must be at most 64 KiB");
 		}
 
+		// Pin all explicit sources before admission, without making another run
+		// wait for this run's Git checks or checkout preparation.
+		let bundlePlan: WorktreeBundleInfo | undefined;
+		try {
+			if (input.repos !== undefined) bundlePlan = await this.worktrees.planBundle(input.repos, canonical.cwd, recordId);
+		} catch (error) {
+			if (error instanceof WorktreeError) throw new SupervisorError(error.code, error.message);
+			throw error;
+		}
 		return this.withAdmission(async () => {
 			if (this.closed) throw new SupervisorError("SUPERVISOR_CLOSED", "This supervisor session is shutting down");
 			if (continuation) {
@@ -309,8 +324,9 @@ export class Supervisor {
 				const expected = join(this.options.paths.runtimeDirectory, "sessions", `${continuation.control!.conversationId}.jsonl`);
 				if (sessionPath !== expected || !(await lstat(sessionPath)).isFile()) throw new SupervisorError("SESSION_IDENTITY", "Saved session identity changed; refusing continuation");
 			}
-			let worktree: WorktreeInfo | undefined = continuation?.worktree ? structuredClone(continuation.worktree) : undefined;
-			if (isolation === "worktree" && !continuation) {
+			const worktreeBundle = continuation?.worktreeBundle ? structuredClone(continuation.worktreeBundle) : bundlePlan;
+			let worktree = continuation?.worktree ? structuredClone(continuation.worktree) : undefined;
+			if (isolation === "worktree" && !continuation && !worktreeBundle) {
 				try { worktree = await this.worktrees.plan(canonical.checkoutRoot, canonical.cwd, recordId); }
 				catch (error) { if (error instanceof WorktreeError) throw new SupervisorError(error.code, error.message); throw error; }
 			}
@@ -323,8 +339,9 @@ export class Supervisor {
 				...(recipe.taskTransport === "pi-rpc" ? { control: { protocol: "pi-rpc" as const, sessionPath,
 					conversationId: continuation?.control?.conversationId ?? recordId, turn: (continuation?.control?.turn ?? 0) + 1,
 					...(continuation ? { continuedFrom: continuation.id } : {}) } } : {}),
-				...(worktree ? { worktreeOwnerId: continuation?.worktreeOwnerId ?? recordId } : {}),
+				...(worktree || worktreeBundle ? { worktreeOwnerId: continuation?.worktreeOwnerId ?? recordId } : {}),
 				...(worktree ? { worktree } : {}),
+				...(worktreeBundle ? { worktreeBundle } : {}),
 				label: input.label?.trim() ?? input.task.replace(/\s+/g, " ").trim().slice(0, 60),
 				outputProtocol,
 				presentation: presenter.state,
@@ -413,21 +430,34 @@ export class Supervisor {
 		return this.withAdmission(async () => {
 			if (this.closed) throw new SupervisorError("SUPERVISOR_CLOSED", "This supervisor session is shutting down");
 			const record = this.store.get(id)!;
-			if (!record.worktree || record.isolation !== "worktree") throw new SupervisorError("NO_WORKTREE", "This run does not own an isolated worktree");
-			if (this.store.list().some((other) => other.worktree?.path === record.worktree!.path && !isTerminalState(other.state))) throw new SupervisorError("WORKTREE_ACTIVE", "Stop the run and verify process cleanup before removing its worktree");
-			const related = this.store.list().filter((other) => other.worktree?.path === record.worktree!.path);
-			if (related.some((other) => other.state === "interrupted" || other.worktree?.state === "failed")) throw new SupervisorError("WORKTREE_UNCERTAIN", "Workspace setup or process outcome is uncertain; inspect/recover it with Git manually. No files were deleted.");
+			const root = worktreeRoot(record);
+			if (!root || record.isolation !== "worktree") throw new SupervisorError("NO_WORKTREE", "This run does not own an isolated worktree");
+			const related = this.store.list().filter((other) => worktreeRoot(other) === root);
+			if (related.some((other) => !isTerminalState(other.state))) throw new SupervisorError("WORKTREE_ACTIVE", "Stop the run and verify process cleanup before removing its worktree");
+			if (related.some((other) => other.state === "interrupted" || worktreeMembers(other).some((member) => member.state === "failed"))) throw new SupervisorError("WORKTREE_UNCERTAIN", "Workspace setup or process outcome is uncertain; inspect/recover it with Git manually. No files were deleted.");
 			if (related.some((other) => other.processPid && (isPidAlive(other.processPid) || isProcessGroupAlive(other.processPid)))) throw new SupervisorError("WORKTREE_ACTIVE", "A process/group may still be live; refusing workspace removal");
 			for (const other of related.filter((run) => run.processPid)) {
 				const remaining = await findOwnedProcesses(other.processToken, other.processStartIdentity);
 				if (!remaining) throw new SupervisorError("WORKTREE_UNCERTAIN", "Could not inspect owned descendants; no files were deleted.");
 				if (remaining.length) throw new SupervisorError("WORKTREE_ACTIVE", "Owned descendants are still live; refusing workspace removal");
 			}
-			await this.worktrees.remove(record.worktree, record.worktreeOwnerId ?? record.id);
-			for (const other of this.store.list()) {
-				if (other.worktree?.path === record.worktree.path) { other.worktree = structuredClone(record.worktree); await this.store.persist(other); }
+			const ownerId = record.worktreeOwnerId ?? record.id;
+			const states = worktreeMembers(record).map((member) => member.state);
+			try {
+				if (record.worktreeBundle) await this.worktrees.removeBundle(record.worktreeBundle, ownerId);
+				else await this.worktrees.remove(record.worktree!, ownerId);
+			} finally {
+				// External Git activity can interrupt removal midway. Keep every
+				// related record updated about what was actually removed.
+				if (worktreeMembers(record).some((member, index) => member.state !== states[index])) {
+					for (const other of related) {
+						if (record.worktreeBundle) other.worktreeBundle = structuredClone(record.worktreeBundle);
+						else other.worktree = structuredClone(record.worktree!);
+						await this.store.persist(other);
+					}
+					this.changed();
+				}
 			}
-			this.changed();
 			return this.store.view(record, this.limits.outputTailBytes);
 		});
 	}
@@ -472,17 +502,25 @@ export class Supervisor {
 				return;
 			}
 
-			if (job.record.worktree) {
-				job.presenter.state.activity = "Preparing isolated worktree";
+			const { worktree, worktreeBundle, worktreeOwnerId, control, id } = job.record;
+			if (worktree || worktreeBundle) {
+				job.presenter.state.activity = worktreeBundle ? "Preparing worktree bundle" : "Preparing isolated worktree";
 				this.changed();
-				job.record.cwd = job.record.control?.continuedFrom
-					? await this.worktrees.resume(job.record.worktree, job.record.worktreeOwnerId!)
-					: await this.worktrees.prepare(job.record.worktree, job.record.id);
+				const cancelled = () => job.cancelRequested || this.closed;
+				if (worktreeBundle) {
+					job.record.cwd = control?.continuedFrom
+						? await this.worktrees.resumeBundle(worktreeBundle, worktreeOwnerId!)
+						: await this.worktrees.prepareBundle(worktreeBundle, id, cancelled);
+				} else {
+					job.record.cwd = control?.continuedFrom
+						? await this.worktrees.resume(worktree!, worktreeOwnerId!)
+						: await this.worktrees.prepare(worktree!, id);
+				}
 				delete job.presenter.state.activity;
 				await this.store.persist(job.record);
 				this.changed();
-				if (job.cancelRequested || this.closed) {
-					await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was cancelled during workspace preparation; worktree retained" });
+				if (cancelled()) {
+					await this.finish(job, "cancelled", { code: "CANCELLED", message: "Run was cancelled during workspace preparation; any created worktrees are retained" });
 					return;
 				}
 			}
@@ -672,8 +710,10 @@ export class Supervisor {
 			terminalState = "interrupted";
 			terminalError = error ?? { code: "CLEANUP_UNVERIFIED", message: "Owned process cleanup could not be verified; inspect the run's processes manually." };
 		}
-		if (job.record.worktree?.state === "ready") job.record.worktree.state = "retained";
-		else if (job.record.worktree?.state === "pending") job.record.worktree.state = "not_created";
+		for (const worktree of worktreeMembers(job.record)) {
+			if (worktree.state === "ready") worktree.state = "retained";
+			else if (worktree.state === "pending") worktree.state = "not_created";
+		}
 		job.presenter.finish(terminalState === "exited" && close?.exitCode === 0 && !terminalError);
 		job.finished = true;
 		job.record.state = terminalState;
@@ -698,6 +738,7 @@ export class Supervisor {
 						protocolWarning: job.record.presentation?.protocolWarning,
 						profile: job.record.profile,
 						...(job.record.worktree ? { worktree: structuredClone(job.record.worktree) } : {}),
+						...(job.record.worktreeBundle ? { worktreeBundle: structuredClone(job.record.worktreeBundle) } : {}),
 						state: job.record.state,
 						...(job.record.exitCode !== undefined ? { exitCode: job.record.exitCode } : {}),
 						...(job.record.error ? { error: job.record.error } : {}),

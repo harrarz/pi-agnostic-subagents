@@ -25,7 +25,7 @@ process.stdin.on('data', (chunk) => {
       try { options = JSON.parse(command.message); } catch { options = {}; }
       messages.push(command.message);
       writeFileSync(session, JSON.stringify(messages), { mode:0o600 });
-      if (options.write) appendFileSync('work.txt', options.write);
+      if (options.write) appendFileSync(options.file ?? 'work.txt', options.write);
       emit({type:'agent_start'});
       if (options.earlyEnd) emit({type:'agent_end',willRetry:true});
       if (options.rejectPrompt) { emit({id:command.id,type:'response',command:'prompt',success:false,error:'rejected prompt'}); continue; }

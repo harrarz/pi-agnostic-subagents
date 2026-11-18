@@ -12,12 +12,15 @@ test("installed Pi RPC launches over ten shared agents without limits and suppor
 	const agent = join(root, "agent");
 	const config = join(agent, "agent-supervisor");
 	const project = join(root, "project");
+	const peer = join(root, "other repo");
 	await mkdir(config, { recursive: true });
-	await mkdir(project);
-	execFileSync("git", ["init", "-q", "-b", "main", project]);
-	await writeFile(join(project, "tracked.txt"), "committed source\n");
-	execFileSync("git", ["-C", project, "add", "--all"]);
-	execFileSync("git", ["-C", project, "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgSign=false", "commit", "-qm", "seed"]);
+	for (const repo of [project, peer]) {
+		await mkdir(repo);
+		execFileSync("git", ["init", "-q", "-b", "main", repo]);
+		await writeFile(join(repo, "tracked.txt"), "committed source\n");
+		execFileSync("git", ["-C", repo, "add", "--all"]);
+		execFileSync("git", ["-C", repo, "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgSign=false", "commit", "-qm", "seed"]);
+	}
 	await writeFile(join(config, "profiles.json"), JSON.stringify({ defaultProfile: "fake", profiles: { fake: {
 		executable: process.execPath, args: [resolve("test/fixtures/fake-agent.mjs"), "--", "{task}"], taskTransport: "argument", outputProtocol: "text",
 	} } }));
@@ -69,6 +72,18 @@ test("installed Pi RPC launches over ten shared agents without limits and suppor
 		await assert.rejects(stat(one.cwd), { code: "ENOENT" });
 		assert.equal(execFileSync("git", ["-C", project, "rev-parse", `refs/heads/${one.worktree!.branch}`], { encoding: "utf8" }).trim(), one.worktree!.baseCommit);
 		assert.ok((await stat(two.cwd)).isDirectory());
+
+		const task = JSON.stringify({ mode: "bundle", repos: ["project", "other repo"], text: "rpc" });
+		const bundled = await client.request({ type: "prompt", message: `/agent run --label bundle --repo .=main --repo '../other repo=main' -- ${task}` });
+		assert.equal(bundled.success, true);
+		const settled = await waitRun("bundle", "exited");
+		const bundle = settled.worktreeBundle!;
+		assert.equal(settled.cwd, bundle.path);
+		assert.deepEqual(bundle.members.map((member) => member.sourceRoot), [project, peer]);
+		for (const member of bundle.members) assert.equal(await readFile(join(member.path, "fix.txt"), "utf8"), "rpc:committed source\n");
+		assert.equal((await client.request({ type: "prompt", message: `/agent show ${settled.id}` })).success, true);
+		await client.waitFor((record) => record.type === "extension_ui_request" && record.method === "notify" && String(record.message).startsWith(`Run ${settled.id} —`)
+			&& bundle.members.every((member) => String(record.message).includes(member.path) && String(record.message).includes(`Base: ${member.baseCommit}`)));
 
 		const labels = Array.from({ length: 12 }, (_, index) => `unrestricted-${index}`);
 		await Promise.all(labels.map(async (label) => {

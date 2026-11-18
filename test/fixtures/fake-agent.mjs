@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 function parseTask(value) {
 	try {
@@ -36,6 +37,13 @@ switch (mode) {
 	case "workspace": {
 		const before = await readFile(task.readPath ?? "tracked.txt", "utf8");
 		await writeFile(task.file ?? "work.txt", task.text ?? "isolated edit", "utf8");
+		process.stdout.write(JSON.stringify({ cwd: process.cwd(), before }) + "\n");
+		if (task.ms) await new Promise((resolve) => setTimeout(resolve, task.ms));
+		break;
+	}
+	case "bundle": {
+		const before = await Promise.all(task.repos.map((repo) => readFile(join(repo, "tracked.txt"), "utf8")));
+		await Promise.all(task.repos.map((repo, index) => writeFile(join(repo, "fix.txt"), `${task.text}:${before[index]}`)));
 		process.stdout.write(JSON.stringify({ cwd: process.cwd(), before }) + "\n");
 		if (task.ms) await new Promise((resolve) => setTimeout(resolve, task.ms));
 		break;

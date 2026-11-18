@@ -168,6 +168,26 @@ test("inline actions depend on state/capabilities and left/right select without 
 	assert.deepEqual(browserActions(run(3, "stopping")), ["inspect"]);
 });
 
+test("browser Workspace view shows both worktree bundle members and their pins", () => {
+	const fake = new FakeSupervisor();
+	const record = run(1, "exited");
+	const path = "/worktrees/bundle";
+	const members = ["web", "api"].map((name, index) => ({ name, ref: "feat/qa", path: `${path}/${name}`, branch: `pi-agent/${record.id}`,
+		baseCommit: String(index + 1).repeat(40), sourceRoot: `/sources/${name}`, sourceCwd: `/sources/${name}`, commonDir: `/sources/${name}/.git`,
+		relativeCwd: "", state: "retained" as const, note: "retained" }));
+	fake.runs = [{ ...record, isolation: "worktree", cwd: path, worktreeBundle: { path, members } }];
+	const { view } = browser(fake, 36);
+	try {
+		assert.match(view.render(100).join("\n"), /2 worktrees/);
+		view.handleInput("\x1b[D"); // Last action: Workspace.
+		view.handleInput("enter");
+		const rendered = view.render(100).join("\n");
+		assert.match(rendered, /Worktree bundle: \/worktrees\/bundle/);
+		for (const member of members) { assert.ok(rendered.includes(member.path)); assert.ok(rendered.includes(member.baseCommit)); }
+		assert.doesNotMatch(rendered, /Isolation: shared/);
+	} finally { view.dispose(); }
+});
+
 test("browser paints a complete fixed-size rectangle, including blank cells, after view changes", () => {
 	const { view } = browser();
 	try {

@@ -1,7 +1,7 @@
 import type { Theme, KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import type { PiCommandContext, PiContext } from "./pi-api.js";
-import { oneLine, runActivity, runLine, runTitle, safeText, stateIndicator } from "./display.js";
+import { bundleLines, oneLine, runActivity, runLine, runTitle, safeText, stateIndicator } from "./display.js";
 import { isTerminalState, type RunSummary } from "./run-store.js";
 import type { Supervisor } from "./supervisor.js";
 import { extensionLabel, type ExtensionPicker } from "./worker-extensions.js";
@@ -246,10 +246,12 @@ export class AgentBrowser implements Component {
 		const presentation = detail.presentation;
 		const lines = [runLine(run), `Parent: main · session ${run.sessionId.slice(0, 8)}`, `Profile: ${run.profile} · ${run.model ?? "CLI configuration"}${run.effortAlias ? ` · ${run.effortAlias}` : ""}`, `Directory: ${run.cwd}`, `Task: ${run.task}`];
 		if (run.extensions) lines.push(`Extensions: ${extensionLabel(run.extensions)} · ${run.extensions.paths.length} selected`, ...run.extensions.paths.map((path) => `  ${path}`));
-		if (!run.worktree) lines.push("Isolation: shared · concurrent writes; overlapping edits can overwrite each other.");
-		if (run.worktree) lines.push(`Worktree: ${run.worktree.path} · ${run.worktree.state}`, `Branch: ${run.worktree.branch}`, `Source: ${run.worktree.sourceCwd}`, `Base: ${run.worktree.baseCommit}`, run.worktree.note, `Cleanup (clean only): /agent worktree remove ${run.id}`);
+		if (run.worktreeBundle) lines.push(...bundleLines(run.worktreeBundle));
+		else if (run.worktree) lines.push(`Worktree: ${run.worktree.path} · ${run.worktree.state}`, `Branch: ${run.worktree.branch}`, `Source: ${run.worktree.sourceCwd}`, `Base: ${run.worktree.baseCommit}`, run.worktree.note);
+		else lines.push("Isolation: shared · concurrent writes; overlapping edits can overwrite each other.");
+		if (run.worktreeBundle || run.worktree) lines.push(`Cleanup (clean only): /agent worktree remove ${run.id}`);
 		if (run.control) lines.push(`Conversation: ${run.control.conversationId} · turn ${run.control.turn}${run.control.continuedFrom ? ` · follows ${run.control.continuedFrom}` : ""}`);
-		if (this.mode === "workspace") return [...lines, "", "Workspace is retained. Cleanup is explicit and refuses dirty/ignored files.", `Use /agent worktree remove ${run.id}; branch is kept.`];
+		if (this.mode === "workspace") return [...lines, "", "Checkouts are retained until explicit cleanup. Dirty/ignored files are refused; branches are kept."];
 		if (run.exitCode !== undefined) lines.push(`Exit code: ${run.exitCode} (not a correctness judgment)`);
 		if (run.error) lines.push(`Process note: ${run.error.message}`);
 		if (presentation?.protocolWarning) lines.push(`Protocol note: ${presentation.protocolWarning}`);

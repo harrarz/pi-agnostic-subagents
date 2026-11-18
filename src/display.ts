@@ -1,6 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { getTerminalColorMode, rgbColor, stripTerminalSequences, styleText } from "@earendil-works/pi-tui";
 import { isTerminalState, type RunSummary } from "./run-store.js";
+import type { WorktreeBundleInfo } from "./worktrees.js";
 
 /** Child-authored strings must never execute terminal controls in a UI surface. */
 export function safeText(value: string): string {
@@ -53,7 +54,17 @@ export function stateIndicator(run: RunSummary, theme: Theme): string {
 }
 
 export function runLine(run: RunSummary, now = Date.now(), theme?: Theme): string {
-	return `${runTitle(run)} · ${theme ? stateIndicator(run, theme) : run.state} · ${elapsed(run, now)}${run.isolation === "worktree" ? " · worktree" : ""}`;
+	return `${runTitle(run)} · ${theme ? stateIndicator(run, theme) : run.state} · ${elapsed(run, now)}${run.worktreeBundle ? ` · ${run.worktreeBundle.members.length} worktrees` : run.isolation === "worktree" ? " · worktree" : ""}`;
+}
+
+export function bundleLines(bundle: WorktreeBundleInfo): string[] {
+	return [`Worktree bundle: ${bundle.path}`, ...bundle.members.flatMap((member) => [
+		`${member.name}: ${member.path} (${member.state})`,
+		`  Branch: ${member.branch} · Ref: ${member.ref}`,
+		`  Source: ${member.sourceRoot}`,
+		`  Base: ${member.baseCommit}`,
+		...(member.state === "failed" ? [`  ${member.note}`] : []),
+	])];
 }
 
 export function runActivity(run: RunSummary): string {
