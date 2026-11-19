@@ -1,5 +1,5 @@
 import { isAbsolute } from "node:path";
-import type { OutputProtocol } from "./presentation.js";
+import { OUTPUT_PROTOCOLS, type OutputProtocol } from "./presentation.js";
 
 export type ExtensionMode = "none" | "inherit" | "custom";
 export interface ExtensionSelection { mode: ExtensionMode; set?: string }
@@ -199,8 +199,8 @@ function parseExtensionArguments(value: unknown, path: string): ExtensionArgumen
 function parseProfile(value: unknown, path: string): LaunchProfile {
 	const record = requireRecord(value, path);
 	assertOnlyKeys(record, ["executable", "args", "taskTransport", "environment", "models", "defaultEffort", "outputProtocol", "modelArgs", "effortArgs", "modelFormat", "parentProviders", "extensionArgs", "extensions"], path);
-	if (record.outputProtocol !== undefined && (typeof record.outputProtocol !== "string" || !["raw", "text", "pi-jsonl", "codex-jsonl"].includes(record.outputProtocol))) {
-		fail(`${path}.outputProtocol`, "expected raw, text, pi-jsonl, or codex-jsonl");
+	if (record.outputProtocol !== undefined && (typeof record.outputProtocol !== "string" || !(OUTPUT_PROTOCOLS as readonly string[]).includes(record.outputProtocol))) {
+		fail(`${path}.outputProtocol`, `expected one of ${OUTPUT_PROTOCOLS.join(", ")}`);
 	}
 
 	const extensionArgs = parseExtensionArguments(record.extensionArgs, `${path}.extensionArgs`);

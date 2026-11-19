@@ -75,12 +75,14 @@ test("Claude Code profile flags parse in help mode without submitting a task", {
 	assert.equal(version.status, 0, version.stderr);
 
 	const config = loadBundledSupervisorConfig();
-	const recipe = resolveLaunchRecipe(config, { profile: "claude-code", model: "sonnet", task: "offline flag smoke test" });
+	const recipe = resolveLaunchRecipe(config, { profile: "claude-code", model: "sonnet", effort: "max", task: "offline flag smoke test" });
 	assert.equal(recipe.taskTransport, "stdin");
 	assert.equal(recipe.stdin, "offline flag smoke test");
 	const help = spawnSync(claudeBin, [...recipe.args, "--help"], { encoding: "utf8", timeout: 15_000 });
 	assert.ifError(help.error);
 	assert.equal(help.status, 0, help.stderr);
 	assert.match(help.stdout, /--permission-mode/);
-	assert.match(help.stdout, /--output-format/);
+	assert.match(help.stdout, /"stream-json"/);
+	assert.match(help.stdout, /--verbose/);
+	for (const effort of Object.values(config.profiles["claude-code"].models!.sonnet.efforts!)) assert.match(help.stdout.match(/--effort[^)]*\)/s)?.[0] ?? "", new RegExp(`\\b${effort}\\b`));
 });

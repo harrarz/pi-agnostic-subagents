@@ -43,13 +43,18 @@ export const BUNDLED_PROFILE_CONFIG: unknown = {
 			},
 		},
 		"claude-code": {
+			outputProtocol: "claude-stream-json",
 			executable: "claude",
-			args: ["--print", "--no-session-persistence", "{modelArgs}", "--permission-mode", "acceptEdits", "--output-format", "json"],
+			args: ["--print", "--no-session-persistence", "{modelArgs}", "{effortArgs}", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"],
 			taskTransport: "stdin",
 			modelArgs: ["--model", "{model}"],
+			effortArgs: ["--effort", "{effort}"],
 			modelFormat: "id",
 			parentProviders: ["anthropic"],
-			models: { sonnet: {}, opus: {} },
+			models: {
+				sonnet: { efforts: { low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } },
+				opus: { efforts: { low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } },
+			},
 		},
 	},
 };

@@ -1,6 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
 
-export type OutputProtocol = "raw" | "text" | "pi-jsonl" | "codex-jsonl";
+export const OUTPUT_PROTOCOLS = ["raw", "text", "pi-jsonl", "codex-jsonl", "claude-stream-json"] as const;
+export type OutputProtocol = typeof OUTPUT_PROTOCOLS[number];
 export interface TranscriptEntry {
 	kind: "user" | "assistant" | "tool" | "error";
 	text: string;
@@ -70,7 +71,7 @@ export class OutputPresenter {
 				this.state.finalAnswer = this.text.trim();
 				this.state.answerTruncated = this.textTruncated;
 			}
-		} else if (this.protocol === "pi-jsonl" || this.protocol === "codex-jsonl") {
+		} else if (this.protocol !== "raw") {
 			if (publishAnswer && this.settled && !this.protocolFailed && this.candidate) {
 				this.state.finalAnswer = this.candidate;
 				this.state.answerTruncated = this.candidate.endsWith("… [truncated]");
@@ -115,6 +116,7 @@ export class OutputPresenter {
 		try { event = object(JSON.parse(line)); }
 		catch { this.warn("Malformed protocol record skipped; inspect diagnostics."); return; }
 		if (this.protocol === "codex-jsonl") { this.codexRecord(event); return; }
+		if (this.protocol === "claude-stream-json") { this.claudeRecord(event); return; }
 		switch (event.type) {
 			case "agent_start":
 			case "turn_start":
@@ -221,6 +223,58 @@ export class OutputPresenter {
 				if (typeof item.id === "string" && this.tools.size < 100) this.tools.set(item.id, activity);
 				if (event.type === "item.started") this.add("tool", activity);
 				this.state.activity = activity;
+			}
+		}
+	}
+
+	private claudeRecord(event: Record<string, unknown>): void {
+		const blocks = (Array.isArray(object(event.message).content) ? object(event.message).content as unknown[] : []).map(object);
+		if (event.type === "system" && event.subtype === "init") {
+			this.settled = false;
+			this.candidate = undefined;
+			this.protocolFailed = false;
+			this.tools.clear();
+			this.state.activity = "Working";
+		} else if (event.type === "assistant") {
+			// Delegated-agent text is commentary; only the top-level agent answers the task.
+			const text = typeof event.parent_tool_use_id === "string" ? "" : textBlocks(blocks);
+			if (text) {
+				this.add("assistant", text);
+				this.candidate = text;
+				this.state.activity = "Writing response";
+			} else if (blocks.some((block) => block.type === "thinking")) this.state.activity = "Thinking";
+			for (const block of blocks) {
+				if (block.type !== "tool_use") continue;
+				const activity = toolActivity(block.name, block.input);
+				if (typeof block.id === "string" && this.tools.size < 100) this.tools.set(block.id, activity);
+				this.candidate = undefined;
+				this.state.activity = activity;
+				this.add("tool", activity);
+			}
+		} else if (event.type === "user") {
+			for (const block of blocks) {
+				if (block.type !== "tool_result") continue;
+				const activity = typeof block.tool_use_id === "string" ? this.tools.get(block.tool_use_id) : undefined;
+				if (typeof block.tool_use_id === "string") this.tools.delete(block.tool_use_id);
+				const failed = block.is_error === true;
+				const output = typeof block.content === "string" ? boundedText(block.content, MAX_ANSWER_CHARS) : textBlocks(block.content);
+				if (output || failed) this.add(failed ? "error" : "tool", `${activity ?? "tool"}${failed ? " failed" : " result"}${output ? `:\n${output}` : ""}`);
+				this.state.activity = this.tools.values().next().value ?? "Working";
+			}
+		} else if (event.type === "result") {
+			this.settled = true;
+			this.tools.clear();
+			const result = typeof event.result === "string" ? boundedText(event.result, MAX_ANSWER_CHARS) : "";
+			if (event.is_error === true || event.subtype !== "success") {
+				this.protocolFailed = true;
+				this.candidate = undefined;
+				const error = boundedText(result || `Agent run ended with ${typeof event.subtype === "string" ? event.subtype : "an error"}; inspect diagnostics.`, 300);
+				this.warn(error);
+				this.add("error", error);
+				this.state.activity = "Agent reported an error";
+			} else {
+				if (result.trim()) this.candidate = result;
+				this.state.activity = "Settled; awaiting process exit";
 			}
 		}
 	}

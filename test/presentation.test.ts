@@ -109,6 +109,83 @@ test("transcript count, transcript size and answer size are bounded independentl
 	assert.equal(presenter.state.transcriptTruncated, true);
 });
 
+function claudeAssistant(presenter: OutputPresenter, content: unknown[], parentToolUseId: string | null = null): void {
+	event(presenter, { type: "assistant", message: { role: "assistant", content, stop_reason: null }, parent_tool_use_id: parentToolUseId });
+}
+function claudeToolResult(presenter: OutputPresenter, id: string, content: unknown, isError = false): void {
+	event(presenter, { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, ...(isError ? { is_error: true } : {}) }] }, parent_tool_use_id: null });
+}
+function claudeResult(presenter: OutputPresenter, fields: Record<string, unknown> = {}): void {
+	event(presenter, { type: "result", subtype: "success", is_error: false, stop_reason: "end_turn", result: "Final answer 雪", ...fields });
+}
+
+test("Claude Code presentation reports tool activity, transcript and only the settled result", () => {
+	const presenter = new OutputPresenter("claude-stream-json");
+	event(presenter, { type: "system", subtype: "hook_started", hook_name: "SessionStart:startup" });
+	event(presenter, { type: "system", subtype: "init", model: "claude-sonnet-5-5" });
+	assert.equal(presenter.state.activity, "Working");
+	claudeAssistant(presenter, [{ type: "thinking", thinking: "SECRET REASONING" }]);
+	assert.equal(presenter.state.activity, "Thinking");
+	claudeAssistant(presenter, [{ type: "tool_use", id: "a", name: "Read", input: { file_path: "note.txt" } }]);
+	claudeAssistant(presenter, [{ type: "tool_use", id: "b", name: "Bash", input: { command: "npm  test" } }]);
+	assert.equal(presenter.state.activity, "Bash · npm test");
+	claudeToolResult(presenter, "b", [{ type: "text", text: "tests passed" }]);
+	assert.equal(presenter.state.activity, "Read · note.txt");
+	claudeToolResult(presenter, "a", "File does not exist.", true);
+	assert.equal(presenter.state.activity, "Working");
+	event(presenter, { type: "rate_limit_event", rate_limit_info: { status: "allowed" } });
+	claudeAssistant(presenter, [{ type: "text", text: "Final answer 雪" }]);
+	assert.equal(presenter.state.finalAnswer, undefined, "assistant text alone is not run completion");
+	claudeResult(presenter);
+	presenter.finish(true);
+	assert.equal(presenter.state.finalAnswer, "Final answer 雪");
+	assert.equal(presenter.state.protocolWarning, undefined);
+	assert.deepEqual(presenter.state.transcript, [
+		{ kind: "tool", text: "Read · note.txt" },
+		{ kind: "tool", text: "Bash · npm test" },
+		{ kind: "tool", text: "Bash · npm test result:\ntests passed" },
+		{ kind: "error", text: "Read · note.txt failed:\nFile does not exist." },
+		{ kind: "assistant", text: "Final answer 雪" },
+	]);
+	assert.doesNotMatch(JSON.stringify(presenter.state), /SECRET REASONING/);
+});
+
+test("Claude Code failed, missing or unsuccessful results never publish an answer", () => {
+	const cases: Array<[string, (presenter: OutputPresenter) => void, boolean, RegExp]> = [
+		["error result", (presenter) => claudeResult(presenter, { is_error: true, result: "Invalid API key" }), true, /Invalid API key/],
+		["turn limit", (presenter) => claudeResult(presenter, { subtype: "error_max_turns", result: undefined }), true, /error_max_turns/],
+		["no result record", () => {}, true, /No settled final answer/],
+		["tool still pending", (presenter) => claudeAssistant(presenter, [{ type: "tool_use", id: "a", name: "Read", input: {} }]), true, /No settled final answer/],
+	];
+	for (const [name, finish, publish, warning] of cases) {
+		const presenter = new OutputPresenter("claude-stream-json");
+		claudeAssistant(presenter, [{ type: "text", text: "candidate" }]);
+		finish(presenter);
+		presenter.finish(publish);
+		assert.equal(presenter.state.finalAnswer, undefined, name);
+		assert.match(presenter.state.protocolWarning!, warning, name);
+	}
+	const processFailure = new OutputPresenter("claude-stream-json");
+	claudeResult(processFailure);
+	processFailure.finish(false);
+	assert.equal(processFailure.state.finalAnswer, undefined);
+});
+
+test("Claude Code delegated-agent text, stale candidates and malformed fields do not become answers", () => {
+	const presenter = new OutputPresenter("claude-stream-json");
+	const malformed = { toString: null, valueOf: null };
+	event(presenter, { type: "assistant", message: { content: malformed }, parent_tool_use_id: malformed });
+	event(presenter, { type: "user", message: { content: [null, { type: "tool_result", tool_use_id: malformed, content: malformed, is_error: true }] } });
+	claudeAssistant(presenter, [{ type: "text", text: "delegated commentary" }], "toolu_parent");
+	assert.doesNotMatch(JSON.stringify(presenter.state.transcript), /delegated commentary/);
+	claudeResult(presenter, { result: "stale" });
+	event(presenter, { type: "system", subtype: "init" });
+	claudeAssistant(presenter, [{ type: "text", text: "last assistant text" }]);
+	claudeResult(presenter, { result: malformed });
+	presenter.finish(true);
+	assert.equal(presenter.state.finalAnswer, "last assistant text");
+});
+
 test("raw output is diagnostic-only and never mistaken for an answer", () => {
 	const presenter = new OutputPresenter("raw");
 	presenter.push(Buffer.from("SECRET RAW LOG\n"));
@@ -129,7 +206,7 @@ test("explicit text output extracts only stdout and bounds long answers", () => 
 test("protocol selection is trusted profile data, not executable name detection", () => {
 	const config = parseSupervisorConfig({ defaultProfile: "arbitrary", profiles: { arbitrary: { executable: "not-pi", args: ["{task}"], taskTransport: "argument", outputProtocol: "pi-jsonl" } } });
 	assert.equal(config.profiles.arbitrary.outputProtocol, "pi-jsonl");
-	for (const outputProtocol of ["guess", ["pi-jsonl"], null, 1]) {
+	for (const outputProtocol of ["guess", "claude-json", ["pi-jsonl"], null, 1]) {
 		assert.throws(() => parseSupervisorConfig({ defaultProfile: "x", profiles: { x: { executable: "pi", args: ["{task}"], taskTransport: "argument", outputProtocol } } }), /outputProtocol/);
 	}
 });

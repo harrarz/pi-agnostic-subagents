@@ -19,7 +19,7 @@ Add a CLI without changing source:
 }
 ```
 
-Use `stdin` transport without `{task}` for stdin-based CLIs. `pi-rpc` requires a whole `{session}` slot and `pi-jsonl` output. Output protocols: `text` for plain stdout, `pi-jsonl` for Pi, `codex-jsonl` for Codex, or `raw` for diagnostics only.
+Use `stdin` transport without `{task}` for stdin-based CLIs. `pi-rpc` requires a whole `{session}` slot and `pi-jsonl` output. Output protocols: `text` for plain stdout, `pi-jsonl` for Pi, `codex-jsonl` for Codex, `claude-stream-json` for Claude Code (`--output-format stream-json --verbose`), or `raw` for diagnostics only.
 
 Profiles are trusted user configuration, never project/task input. Arguments are literal, not shell commands. Add `defaultProfile` to choose a default CLI. Profiles load once per session; restart/reload only after active runs finish. Updates never rewrite private profiles.
 

@@ -53,6 +53,19 @@ switch (mode) {
 		emit({ type: "agent_settled", aborted: false });
 		break;
 	}
+	case "claude-output": {
+		const emit = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+		const assistant = (content) => emit({ type: "assistant", message: { role: "assistant", content, stop_reason: null }, parent_tool_use_id: null });
+		emit({ type: "system", subtype: "hook_started", hook_name: "SessionStart:startup" });
+		emit({ type: "system", subtype: "init", model: "claude-sonnet-5-5", permissionMode: "acceptEdits" });
+		assistant([{ type: "thinking", thinking: "HIDDEN REASONING" }]);
+		assistant([{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "src/auth.ts" } }]);
+		await new Promise((resolve) => setTimeout(resolve, task.ms ?? 150));
+		emit({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "read output" }] }, parent_tool_use_id: null });
+		assistant([{ type: "text", text: "Clean final answer 雪" }]);
+		emit({ type: "result", subtype: "success", is_error: false, stop_reason: "end_turn", result: "Clean final answer 雪" });
+		break;
+	}
 	case "echo":
 		process.stdout.write(`OUT:${task.text ?? rawTask}\n`);
 		process.stderr.write(`ERR:${task.text ?? rawTask}\n`);
