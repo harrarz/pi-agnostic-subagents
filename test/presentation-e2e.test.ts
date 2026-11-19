@@ -57,6 +57,20 @@ test("noisy real child yields clean activity, durable answer and independent dia
 	assert.equal(changes, count);
 });
 
+test("Claude Code stream output yields live tool activity and the settled result", async (t) => {
+	const { supervisor } = await setup(t, "claude-stream-json");
+	const started = await supervisor.start({ task: JSON.stringify({ mode: "claude-output", ms: 350 }) });
+	await waitUntil(() => supervisor.inspect(started.id).presentation?.activity === "Read · src/auth.ts");
+	assert.equal(supervisor.inspect(started.id).presentation?.finalAnswer, undefined);
+	await waitUntil(() => isTerminalState(supervisor.inspect(started.id).state));
+	const completed = await supervisor.get(started.id);
+	assert.equal(completed.state, "exited");
+	assert.equal(completed.outputProtocol, "claude-stream-json");
+	assert.equal(completed.presentation?.finalAnswer, "Clean final answer 雪");
+	assert.match(JSON.stringify(completed.presentation?.transcript), /read output/);
+	assert.doesNotMatch(JSON.stringify(completed.presentation), /HIDDEN REASONING/);
+});
+
 test("independent starts report active state without capacity queues and stop separately", async (t) => {
 	const { supervisor } = await setup(t);
 	const runs = await Promise.all(Array.from({ length: 3 }, () => supervisor.start({ task: JSON.stringify({ mode: "sleep", ms: 60_000 }) })));

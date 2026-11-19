@@ -52,11 +52,16 @@ test("bundled Pi, Codex, and Claude Code profiles resolve generic CLI recipes", 
 	assert.equal(claude.model, "sonnet");
 	assert.equal(claude.effort, undefined);
 	assert.equal(claude.stdin, "edit this checkout");
-	assert.deepEqual(claude.args, ["--print", "--no-session-persistence", "--model", "sonnet", "--permission-mode", "acceptEdits", "--output-format", "json"]);
+	assert.deepEqual(claude.args, ["--print", "--no-session-persistence", "--model", "sonnet", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"]);
+	assert.equal(config.profiles["claude-code"].outputProtocol, "claude-stream-json");
 
 	const claudeOpus = resolveLaunchRecipe(config, { profile: "claude-code", model: "opus", task: "use the alternative model" });
 	assert.equal(claudeOpus.model, "opus");
-	assert.throws(() => resolveLaunchRecipe(config, { profile: "claude-code", model: "sonnet", effort: "high", task: "unsupported effort override" }), /does not support/);
+	assert.equal(claudeOpus.effort, undefined);
+	const claudeEffort = resolveLaunchRecipe(config, { profile: "claude-code", model: "opus", effort: "xhigh", task: "raise the effort" });
+	assert.equal(claudeEffort.effort, "xhigh");
+	assert.deepEqual(claudeEffort.args, ["--print", "--no-session-persistence", "--model", "opus", "--effort", "xhigh", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"]);
+	assert.throws(() => resolveLaunchRecipe(config, { profile: "claude-code", model: "sonnet", effort: "ultra", task: "unsupported effort override" }), /does not support/);
 });
 
 test("loads the fake-profile fixture and resolves explicit model and configured effort independently", async () => {

@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- Decode Claude Code output through a `claude-stream-json` protocol: the bundled `claude-code` profile now launches with `--output-format stream-json --verbose` and reports live tool activity, a readable transcript, and the final answer from the CLI's `result` record, falling back to the last top-level assistant text when a successful record carries no text. Failed or missing results never publish an answer.
+- Add `low`–`max` effort selection (`--effort`) for the bundled Claude Code `sonnet` and `opus` models. Omitted effort leaves the CLI default unchanged.
+
 ## [0.2.0]
 
 - Add opt-in worker extension modes (`none`, `inherit`, `custom`), trusted named sets, per-profile preferences, run overrides, and a TUI picker/rerun editor. Existing profiles and the default extension-free launch remain unchanged.
