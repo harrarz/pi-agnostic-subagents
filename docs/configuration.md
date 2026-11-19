@@ -84,6 +84,8 @@ Each ref is pinned to a commit before any worktree is created. The worker starts
 
 `/agent show <id>` and `agent_get` report each checkout, branch, and pinned commit. Review, commit, and merge per repo. Follow-up reuses the original bundle; a fresh rerun resolves the same refs again. Worktrees and branches stay retained. `/agent worktree remove <id>` requires confirmation and verified process cleanup; it checks that all checkouts are clean before removing any, never forces deletion, and keeps the branches and any files in the bundle directory outside the checkouts.
 
-`/agent` inspects runs and offers human-directed steering/follow-up for RPC profiles. Model tools remain `agent_start`, `agent_get`, and `agent_stop`; `agent_get` supports `answer`, `transcript`, and `raw` views.
+`/agent` inspects runs and offers human-directed steering/follow-up for RPC profiles. Model tools are `agent_start`, `agent_get`, `agent_steer`, and `agent_stop`; `agent_get` supports `answer`, `transcript`, and `raw` views and reports `canSteer`.
+
+`agent_steer({ id, message })` sends one instruction to a running RPC worker owned by the current supervisor. `queued` means Pi accepted it for delivery at a turn boundary, not that the worker received it or acted on it. `handled` means a Pi input handler consumed it without queuing it. If the worker finishes during submission, delivery may be uncertain; inspect the transcript or artifact. There is no automatic retry or replacement run.
 
 Private records/logs/sessions live under `agent-supervisor/runtime/`. Diagnostic logs are bounded; saved conversations are not. Remove history only while idle. Worktrees and extension modes are not security sandboxes, and exit code 0 does not establish task correctness.
