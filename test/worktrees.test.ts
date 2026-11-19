@@ -350,7 +350,7 @@ test("model tools expose workspace identity and never expose destructive cleanup
 	const { supervisor } = await fixture(t);
 	const tools = new Map<string, { execute: Function }>();
 	registerAgentTools({ registerTool: (tool: { name: string; execute: Function }) => tools.set(tool.name, tool) } as unknown as PiExtensionApi, async () => supervisor);
-	assert.deepEqual([...tools.keys()].sort(), ["agent_get", "agent_start", "agent_stop"]);
+	assert.deepEqual([...tools.keys()].sort(), ["agent_get", "agent_start", "agent_steer", "agent_stop"]);
 	const start = await tools.get("agent_start")!.execute("start", { task: "tool workspace", isolation: "worktree" }, undefined, undefined, {});
 	const started = JSON.parse(start.content[0].text);
 	assert.equal(started.isolation, "worktree");

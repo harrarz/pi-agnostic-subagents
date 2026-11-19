@@ -186,7 +186,7 @@ test("registers tools/command, starts and inspects a real child in JSON mode, an
 	try {
 		const { pi, tools, commands, handlers } = fakePi();
 		extension(pi as unknown as PiExtensionApi);
-		assert.deepEqual([...tools.keys()].sort(), ["agent_get", "agent_start", "agent_stop"]);
+		assert.deepEqual([...tools.keys()].sort(), ["agent_get", "agent_start", "agent_steer", "agent_stop"]);
 		assert.ok(commands.has("agent"));
 		const envContext = context(project, "extension-json-session", "json", true);
 		for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, envContext.ctx);

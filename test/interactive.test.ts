@@ -7,6 +7,8 @@ import { join, resolve } from "node:path";
 import { Supervisor } from "../src/supervisor.js";
 import { isTerminalState } from "../src/run-store.js";
 import { parseSupervisorConfig, resolveLaunchRecipe } from "../src/profiles.js";
+import type { PiExtensionApi } from "../src/pi-api.js";
+import { registerAgentTools } from "../src/tools.js";
 
 async function setup(t: TestContext) {
 	const root = await mkdtemp(join(tmpdir(), "supervisor-interactive-"));
@@ -19,6 +21,8 @@ async function setup(t: TestContext) {
 	const config = parseSupervisorConfig({ defaultProfile: "custom", profiles: { custom: {
 		executable: process.execPath, args: [resolve("test/fixtures/fake-rpc-agent.mjs"), "--session", "{session}", "{modelArgs}"],
 		modelArgs: ["--model", "{model}"], taskTransport: "pi-rpc", outputProtocol: "pi-jsonl",
+	}, argument: {
+		executable: process.execPath, args: [resolve("test/fixtures/fake-agent.mjs"), "--", "{task}"], taskTransport: "argument",
 	} } });
 	const options = { paths, parentCwd: cwd, sessionId: "interactive", stopGraceMs: 100 };
 	const supervisor = new Supervisor(config, options);
@@ -35,6 +39,74 @@ async function completed(supervisor: Supervisor, id: string) {
 	await wait(() => isTerminalState(supervisor.inspect(id).state));
 	return supervisor.get(id);
 }
+
+function agentTools(supervisor: Supervisor) {
+	const tools = new Map<string, { execute: Function }>();
+	registerAgentTools({ registerTool: (tool: { name: string; execute: Function }) => tools.set(tool.name, tool) } as unknown as PiExtensionApi, async () => supervisor);
+	return async (name: string, params: Record<string, unknown>) => {
+		const result = await tools.get(name)!.execute(name, params, undefined, undefined, {});
+		return JSON.parse(result.content[0].text);
+	};
+}
+
+test("agent_steer reports Pi's queued acknowledgement and redirects the same worker", async (t) => {
+	const { supervisor } = await setup(t);
+	const call = agentTools(supervisor);
+	const { id } = await call("agent_start", { task: '{"delayMs":60000}', model: "chosen/model" });
+	await wait(() => supervisor.inspect(id).capabilities?.steer === true);
+	assert.equal((await call("agent_get", { id })).canSteer, true);
+	const message = "redirect 雪\u2028next line";
+	const ack = await call("agent_steer", { id, message });
+	assert.equal(ack.id, id);
+	assert.equal(ack.disposition, "queued");
+	assert.match(ack.message, /turn boundary.*does not confirm delivery or action/);
+	const run = await completed(supervisor, id);
+	assert.equal(run.presentation?.finalAnswer, `{"delayMs":60000} | ${message}`);
+	assert.deepEqual(supervisor.snapshot().map((run) => run.id), [id]);
+	assert.equal((await call("agent_get", { id })).canSteer, false);
+	await assert.rejects(call("agent_steer", { id, message }), { code: "STEER_UNAVAILABLE" });
+});
+
+test("agent_steer distinguishes input-handler consumption from queuing", async (t) => {
+	const { supervisor } = await setup(t);
+	const run = await supervisor.start({ task: '{"delayMs":60000,"handleSteer":true}', model: "chosen/model" });
+	await wait(() => supervisor.inspect(run.id).capabilities?.steer === true);
+	const ack = await agentTools(supervisor)("agent_steer", { id: run.id, message: "intercept me" });
+	assert.equal(ack.disposition, "handled");
+	assert.match(ack.message, /input handler consumed the instruction without queuing it/);
+});
+
+test("agent_steer rejects unknown, unowned, and running non-RPC agents", async (t) => {
+	const { supervisor, config, options } = await setup(t);
+	const other = new Supervisor(config, { ...options, sessionId: "other-session" });
+	await other.initialize();
+	t.after(() => other.shutdown());
+	const rpc = await supervisor.start({ task: '{"delayMs":60000}', model: "chosen/model" });
+	const unsupported = await supervisor.start({ profile: "argument", task: '{"mode":"sleep","ms":60000}' });
+	await wait(() => supervisor.inspect(rpc.id).capabilities?.steer === true && supervisor.inspect(unsupported.id).state === "running");
+	const call = agentTools(supervisor);
+	assert.equal((await call("agent_get", { id: unsupported.id })).canSteer, false);
+	const steer = (id: string) => call("agent_steer", { id, message: "must not be sent" });
+	await assert.rejects(steer("unknown"), { code: "STEER_UNAVAILABLE" });
+	await assert.rejects(steer(unsupported.id), { code: "STEER_UNAVAILABLE" });
+	await assert.rejects(agentTools(other)("agent_steer", { id: rpc.id, message: "must not be sent" }), { code: "STEER_UNAVAILABLE" });
+	assert.equal(supervisor.inspect(rpc.id).capabilities?.steer, true);
+	assert.deepEqual(JSON.parse(await readFile(supervisor.inspect(rpc.id).control!.sessionPath, "utf8")), ['{"delayMs":60000}']);
+	assert.deepEqual(other.snapshot(), []);
+	assert.equal(supervisor.snapshot().length, 2);
+});
+
+test("agent_steer surfaces uncertain delivery if the turn settles before acknowledgement", async (t) => {
+	const { supervisor } = await setup(t);
+	const task = '{"delayMs":60000,"settleOnSteer":true}';
+	const { id } = await supervisor.start({ task, model: "chosen/model" });
+	await wait(() => supervisor.inspect(id).capabilities?.steer === true);
+	await assert.rejects(agentTools(supervisor)("agent_steer", { id, message: "too close to the end" }), /settled during steering submission; delivery is uncertain.*do not resend automatically/);
+	const run = await completed(supervisor, id);
+	assert.equal(run.state, "exited");
+	assert.equal(run.presentation?.finalAnswer, task);
+	assert.deepEqual(supervisor.snapshot().map((run) => run.id), [id]);
+});
 
 test("explicit RPC transport steers through agent_end and resumes a durable conversation", async (t) => {
 	const { supervisor } = await setup(t);

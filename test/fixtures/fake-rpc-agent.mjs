@@ -34,9 +34,12 @@ process.stdin.on('data', (chunk) => {
       else { ack(); timer = setTimeout(answer, options.delayMs ?? 700); }
     } else if (command.type === 'steer') {
       if (command.message === 'reject') { emit({id:command.id,type:'response',command:'steer',success:false,error:'steer rejected'}); continue; }
-      messages.push(command.message);
-      emit({id:command.id,type:'response',command:'steer',success:true,data:{disposition:'queued'}});
+      const ack = (disposition) => emit({id:command.id,type:'response',command:'steer',success:true,data:{disposition}});
+      if (options.handleSteer) { ack('handled'); continue; }
       clearTimeout(timer);
+      if (options.settleOnSteer) { answer(); ack('queued'); continue; }
+      messages.push(command.message);
+      ack('queued');
       timer = setTimeout(answer, 200);
     }
   }

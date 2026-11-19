@@ -31,6 +31,10 @@ const GetParams = Type.Object({
 		description: "Default answer: clean status and final answer. transcript: bounded readable conversation. raw: diagnostic output tail.",
 	})),
 });
+const SteerParams = Type.Object({
+	id: Type.String({ minLength: 1, description: "Run ID of the owned, running agent to steer" }),
+	message: Type.String({ minLength: 1, description: "New instruction for that same agent (nonempty, NUL-free, at most 64 KiB)" }),
+});
 const StopParams = Type.Object({ id: Type.String({ minLength: 1, description: "Run ID to stop" }) });
 type SupervisorProvider = (ctx: PiToolContext) => Promise<Supervisor>;
 
@@ -40,6 +44,7 @@ function listItem(run: RunSummary) {
 		label: run.label,
 		parent: { sessionId: run.sessionId, label: "main" },
 		state: run.state,
+		canSteer: run.capabilities?.steer ?? false,
 		profile: run.profile,
 		extensions: run.extensions,
 		isolation: run.isolation ?? "shared",
@@ -129,6 +134,24 @@ export function registerAgentTools(pi: PiExtensionApi, getSupervisor: Supervisor
 			return jsonResult({ runs: runs.map(listItem), ...(supervisor.recoveryWarnings.length ? { recoveryWarnings: supervisor.recoveryWarnings } : {}) }, runs.length ? runs.map((run) => runLine(run)).join("\n") : "No supervised agents.");
 		},
 		renderCall: (args, theme) => new Text(theme.fg("toolTitle", `Agent status${args.id ? ` · ${oneLine(args.id, 36)}` : ""}`), 0, 0),
+		renderResult: renderAgentResult,
+	});
+
+	pi.registerTool({
+		name: "agent_steer",
+		label: "Steer agent run",
+		description: "Send one new instruction to an owned running agent that currently supports steering (see agent_get.canSteer). Queued means Pi accepted it for delivery at a turn boundary, not that the agent acted on it. Does not retry or start another run.",
+		parameters: SteerParams,
+		annotations: { destructiveHint: true, openWorldHint: true },
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const supervisor = await getSupervisor(ctx);
+			const disposition = await supervisor.steer(params.id, params.message);
+			const message = disposition === "queued"
+				? "Pi queued the instruction for delivery at a turn boundary. This does not confirm delivery or action by the agent."
+				: "A Pi input handler consumed the instruction without queuing it. This does not confirm action by the agent.";
+			return jsonResult({ id: params.id, disposition, message }, message);
+		},
+		renderCall: (args, theme) => new Text(theme.fg("toolTitle", `Steer agent · ${oneLine(args.id ?? "…", 36)}`), 0, 0),
 		renderResult: renderAgentResult,
 	});
 
